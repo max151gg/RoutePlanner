@@ -23,6 +23,13 @@ const state = {
                          //   reason, avgKm }]
   manualMode: false,     // next optimize should send mode "manual"
   optimizeStale: false,  // groups changed manually since last optimize
+  // --- Visited Stops Tracker (frontend-only, localStorage-backed) ---
+  trackGroups: null,     // normalized [{clusterIndex, title, clustered, stops}]
+  visited: {},           // { stopKey: { visited: true, visitedAt: ISO } }
+  routeSignature: null,  // localStorage key suffix for the current route
+  trackingActive: false, // true once an optimized result is being tracked
+  hideVisited: false,    // collapse visited rows from the list
+  hideVisitedMarkers: false, // hide visited markers from the map
 };
 
 let nextId = 1;
@@ -77,6 +84,14 @@ const el = {
   distanceSensitivity: document.getElementById("distanceSensitivity"),
   autoCombine: document.getElementById("autoCombine"),
   autoMaxStops: document.getElementById("autoMaxStops"),
+  // Visited Stops Tracker
+  tracker: document.getElementById("tracker"),
+  globalProgress: document.getElementById("globalProgress"),
+  nextStop: document.getElementById("nextStop"),
+  hideVisited: document.getElementById("hideVisited"),
+  hideVisitedMarkers: document.getElementById("hideVisitedMarkers"),
+  clearRouteProgressBtn: document.getElementById("clearRouteProgressBtn"),
+  clearAllProgressBtn: document.getElementById("clearAllProgressBtn"),
 };
 
 // Distinct colors for route-group polylines / markers.
@@ -143,10 +158,17 @@ function resetGroups() {
   state.groups = null;
   state.manualMode = false;
   state.optimizeStale = false;
+  // The route changed; pause tracking until a fresh optimize.
+  state.trackingActive = false;
+  state.trackGroups = null;
+  if (el.tracker) el.tracker.classList.add("hidden");
   if (el.routeGroups) el.routeGroups.classList.add("hidden");
   if (el.groupCards) el.groupCards.innerHTML = "";
   if (el.autoSummary) el.autoSummary.classList.add("hidden");
   if (el.manualNote) el.manualNote.classList.add("hidden");
+  // A stale single-route result would still show visited buttons - hide it too.
+  if (el.results) el.results.classList.add("hidden");
+  if (el.orderedList) el.orderedList.innerHTML = "";
 }
 
 /* ---------------------------------------------------------------------------
@@ -552,12 +574,18 @@ async function optimizeRoute() {
       }));
       state.optimizeStale = false;
       state.manualMode = false;
+      prepareTracking();   // build signature + load saved visited state
       renderGroups();
       drawGroups();
+      renderVisitedProgress();
+      el.routeGroups.scrollIntoView({ behavior: "smooth", block: "nearest" });
     } else {
       state.groups = null;
+      prepareTracking();
       renderResults(data);
       drawRoute(data);
+      renderVisitedProgress();
+      el.results.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
   } catch (err) {
     showError("Network error during optimization: " + err.message);
@@ -587,11 +615,16 @@ function renderResults(data) {
   }
 
   el.orderedList.innerHTML = "";
+  // Single route is tracked as cluster 0.
+  if (state.trackingActive) {
+    const grp = trackGroupByIndex(0);
+    if (grp) el.orderedList.appendChild(buildRouteVisitedControls(grp));
+  }
   data.orderedStops.forEach((stop) => {
-    el.orderedList.appendChild(orderedItem(stop, stop.optimizedIndex, "#4f8cff"));
+    const key = getStopKey(0, stop);
+    if (state.trackingActive && state.hideVisited && isVisited(key)) return;
+    el.orderedList.appendChild(orderedItem(stop, stop.optimizedIndex, "#4f8cff", key));
   });
-
-  el.results.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 /* ----- Clustered result (rendered from editable state.groups) ----- */
@@ -681,11 +714,22 @@ function renderGroups() {
       card.append(note);
     }
 
+    // Visited progress + per-route visited controls (tracking only).
+    let progress = null;
+    if (state.trackingActive && group.optimized) {
+      const trackGroup = { clusterIndex: ci, title: "Route " + ci, stops: group.stops };
+      progress = getRouteGroupProgress(trackGroup);
+      if (progress.complete) card.classList.add("completed");
+      card.append(buildRouteVisitedControls(trackGroup));
+    }
+
     // Ordered stops.
     const list = document.createElement("ol");
     list.className = "ordered-list";
     group.stops.forEach((stop, si) => {
-      list.appendChild(orderedItem(stop, ci + "." + (si + 1), color));
+      const key = getStopKey(ci, stop);
+      if (state.trackingActive && state.hideVisited && isVisited(key)) return;
+      list.appendChild(orderedItem(stop, ci + "." + (si + 1), color, key));
     });
     card.append(list);
 
@@ -712,8 +756,6 @@ function renderGroups() {
 
     el.groupCards.appendChild(card);
   });
-
-  el.routeGroups.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 /* ----- Manual combine / separate (operate on state.groups) ----- */
@@ -721,6 +763,9 @@ function renderGroups() {
 function afterManualEdit() {
   state.optimizeStale = true;
   state.manualMode = true;
+  // The route structure changed; visited tracking pauses until re-optimization.
+  state.trackingActive = false;
+  el.tracker.classList.add("hidden");
   renderGroups();
   drawGroups();
 }
@@ -804,15 +849,19 @@ function splitTwo(stops) {
   return [a, b];
 }
 
-/** Build one ordered-list row (used by both single and clustered results). */
-function orderedItem(stop, label, color) {
+/** Build one ordered-list row (used by both single and clustered results).
+ *  When `stopKey` is given and tracking is active, the row shows visited state
+ *  and a Mark visited / Undo control. */
+function orderedItem(stop, label, color, stopKey) {
+  const visited = !!(stopKey && state.trackingActive && isVisited(stopKey));
+
   const li = document.createElement("li");
-  li.className = "ordered-item";
+  li.className = "ordered-item" + (visited ? " visited" : "");
 
   const num = document.createElement("div");
   num.className = "ordered-num";
-  num.style.background = color;
-  num.textContent = label;
+  num.style.background = visited ? "#2ea043" : color;
+  num.textContent = visited ? "✓" : label;
 
   const body = document.createElement("div");
   body.className = "ordered-body";
@@ -824,6 +873,16 @@ function orderedItem(stop, label, color) {
   const formatted = stop.formattedAddress ? stop.formattedAddress + " · " : "";
   orig.textContent = formatted + "orig #" + (stop.originalIndex + 1);
   body.append(addr, orig);
+  if (visited) {
+    const when = state.visited[stopKey] && state.visited[stopKey].visitedAt;
+    const time = document.createElement("div");
+    time.className = "visited-time";
+    time.textContent = "Visited" + (when ? " at " + formatVisitedTime(when) : "");
+    body.append(time);
+  }
+
+  const controls = document.createElement("div");
+  controls.className = "stop-controls";
 
   const waze = document.createElement("a");
   waze.className = "waze-btn";
@@ -831,8 +890,28 @@ function orderedItem(stop, label, color) {
   waze.target = "_blank";
   waze.rel = "noopener";
   waze.textContent = "Open in Waze";
+  controls.append(waze);
 
-  li.append(num, body, waze);
+  if (stopKey && state.trackingActive) {
+    if (visited) {
+      const badge = document.createElement("span");
+      badge.className = "badge badge-green";
+      badge.textContent = "Visited";
+      const undo = document.createElement("button");
+      undo.className = "icon-btn";
+      undo.textContent = "Undo";
+      undo.onclick = () => undoStopVisited(stopKey);
+      controls.append(badge, undo);
+    } else {
+      const mark = document.createElement("button");
+      mark.className = "icon-btn mark-btn";
+      mark.textContent = "Mark visited";
+      mark.onclick = () => markStopVisited(stopKey);
+      controls.append(mark);
+    }
+  }
+
+  li.append(num, body, controls);
   return li;
 }
 
@@ -915,6 +994,10 @@ function clearAll() {
   state.groups = null;
   state.manualMode = false;
   state.optimizeStale = false;
+  state.trackGroups = null;
+  state.visited = {};
+  state.routeSignature = null;
+  state.trackingActive = false;
 
   el.start.value = "";
   el.stopsInput.value = "";
@@ -926,6 +1009,7 @@ function clearAll() {
   el.autoSummary.classList.add("hidden");
   el.autoSummary.innerHTML = "";
   el.manualNote.classList.add("hidden");
+  el.tracker.classList.add("hidden");
   el.warnings.classList.add("hidden");
   el.warnings.innerHTML = "";
   setStatus("Not validated", "gray");
@@ -942,6 +1026,7 @@ let map = null;
 let mapMarkers = [];
 let mapPolylines = [];
 let clusterBoundsMap = {}; // clusterIndex -> LatLngBounds (for "Focus on map")
+let markerByKey = {};      // stopKey -> { marker, color, label, scale, fontSize }
 
 /** Decode a Google encoded polyline into [{lat, lng}, ...]. */
 function decodePolyline(encoded) {
@@ -995,6 +1080,7 @@ function clearMap() {
   mapMarkers = [];
   mapPolylines = [];
   clusterBoundsMap = {};
+  markerByKey = {};
 }
 
 function addMarker(position, label, color, scale, fontSize) {
@@ -1017,6 +1103,48 @@ function addMarker(position, label, color, scale, fontSize) {
     },
   });
   mapMarkers.push(marker);
+  return marker;
+}
+
+/** Register a stop marker under its stop key so it can be restyled on visit. */
+function registerStopMarker(stopKey, marker, color, label, scale, fontSize) {
+  markerByKey[stopKey] = { marker, color, label, scale, fontSize };
+}
+
+/** Apply visited vs. normal style to one registered marker (no polyline touch). */
+function applyMarkerVisited(rec, visited) {
+  rec.marker.setIcon({
+    path: google.maps.SymbolPath.CIRCLE,
+    scale: rec.scale,
+    fillColor: visited ? "#2ea043" : rec.color,
+    fillOpacity: visited ? 0.95 : 1,
+    strokeColor: "#0f1419",
+    strokeWeight: 2,
+  });
+  rec.marker.setLabel({
+    text: visited ? "✓" : rec.label,
+    color: "#0f1419",
+    fontSize: rec.fontSize,
+    fontWeight: "700",
+  });
+}
+
+/** Update a single marker to reflect its current visited state. */
+function updateMarkerVisitedState(stopKey) {
+  const rec = markerByKey[stopKey];
+  if (!rec) return;
+  const visited = isVisited(stopKey);
+  if (state.hideVisitedMarkers && visited) {
+    rec.marker.setMap(null);
+  } else {
+    rec.marker.setMap(map);
+    applyMarkerVisited(rec, visited);
+  }
+}
+
+/** Restyle all stop markers (used after group/global visited changes). */
+function updateAllMarkers() {
+  Object.keys(markerByKey).forEach((key) => updateMarkerVisitedState(key));
 }
 
 function addPolyline(encoded, color, bounds, clusterBounds) {
@@ -1053,12 +1181,15 @@ function drawRoute(data) {
   data.orderedStops.forEach((stop) => {
     if (stop.lat == null) return;
     const pos = { lat: stop.lat, lng: stop.lng };
-    addMarker(pos, String(stop.optimizedIndex), "#4f8cff");
+    const labelText = String(stop.optimizedIndex);
+    const marker = addMarker(pos, labelText, "#4f8cff", 13, "11px");
+    registerStopMarker(getStopKey(0, stop), marker, "#4f8cff", labelText, 13, "11px");
     bounds.extend(pos);
   });
 
   (data.encodedPolylines || []).forEach((enc) => addPolyline(enc, "#4f8cff", bounds));
 
+  updateAllMarkers(); // apply any restored visited styling
   if (!bounds.isEmpty()) map.fitBounds(bounds);
 }
 
@@ -1091,7 +1222,9 @@ function drawGroups() {
     group.stops.forEach((stop, si) => {
       if (stop.lat == null) return;
       const pos = { lat: stop.lat, lng: stop.lng };
-      addMarker(pos, ci + "." + (si + 1), color, 15, "10px");
+      const labelText = ci + "." + (si + 1);
+      const marker = addMarker(pos, labelText, color, 15, "10px");
+      registerStopMarker(getStopKey(ci, stop), marker, color, labelText, 15, "10px");
       bounds.extend(pos);
       clusterBounds.extend(pos);
     });
@@ -1104,6 +1237,7 @@ function drawGroups() {
     clusterBoundsMap[ci] = clusterBounds;
   });
 
+  updateAllMarkers(); // apply any restored visited styling
   if (!bounds.isEmpty()) map.fitBounds(bounds);
 }
 
@@ -1156,6 +1290,299 @@ const DARK_MAP_STYLE = [
 ];
 
 /* ---------------------------------------------------------------------------
+ * Visited Stops Tracker
+ *
+ * Pure frontend progress layer over an already-calculated result. It never calls
+ * the backend or Google, and never changes the optimized order. Visited state is
+ * persisted in localStorage under a per-route signature.
+ * ------------------------------------------------------------------------- */
+
+/** djb2-style string hash -> short base36 string (for the storage key). */
+function hashString(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = (h << 5) + h + str.charCodeAt(i);
+    h |= 0; // keep 32-bit
+  }
+  return (h >>> 0).toString(36);
+}
+
+/** "HH:mm" from an ISO timestamp. */
+function formatVisitedTime(iso) {
+  try {
+    const d = new Date(iso);
+    const h = String(d.getHours()).padStart(2, "0");
+    const m = String(d.getMinutes()).padStart(2, "0");
+    return h + ":" + m;
+  } catch (e) {
+    return "";
+  }
+}
+
+/** Stable key for a stop. clusterIndex 0 = non-clustered (single) route. */
+function getStopKey(clusterIndex, stop) {
+  return "cluster-" + clusterIndex + "-stop-" + stop.originalIndex;
+}
+
+function trackGroupByIndex(clusterIndex) {
+  return (state.trackGroups || []).find((g) => g.clusterIndex === clusterIndex);
+}
+
+/** Normalize the current result (single or clustered) for tracking. */
+function buildTrackGroups() {
+  if (state.groups) {
+    state.trackGroups = state.groups.map((g, gi) => ({
+      clusterIndex: gi + 1,
+      title: "Route " + (gi + 1),
+      clustered: true,
+      stops: g.stops,
+    }));
+  } else if (state.lastResult && state.lastResult.orderedStops) {
+    state.trackGroups = [{
+      clusterIndex: 0,
+      title: null,
+      clustered: false,
+      stops: state.lastResult.orderedStops,
+    }];
+  } else {
+    state.trackGroups = null;
+  }
+}
+
+/** Signature from start + ordered stop addresses + group structure. */
+function generateRouteSignature() {
+  const parts = [state.startAddress || ""];
+  (state.trackGroups || []).forEach((g) => {
+    parts.push("g" + g.clusterIndex);
+    g.stops.forEach((s) => parts.push(s.originalIndex + ":" + (s.address || "")));
+  });
+  return "sig_" + hashString(parts.join("|"));
+}
+
+function storageKeyFor(signature) {
+  return "visitedStops:" + signature;
+}
+
+function loadVisitedState(signature) {
+  state.routeSignature = signature;
+  let visited = {};
+  try {
+    const raw = localStorage.getItem(storageKeyFor(signature));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.visited) visited = parsed.visited;
+    }
+  } catch (e) {
+    visited = {};
+  }
+  state.visited = visited;
+}
+
+function saveVisitedState() {
+  if (!state.routeSignature) return;
+  try {
+    localStorage.setItem(storageKeyFor(state.routeSignature),
+      JSON.stringify({ visited: state.visited }));
+  } catch (e) {
+    /* storage full / disabled - progress just won't persist */
+  }
+}
+
+/** Build trackGroups + signature + load saved visited state (no DOM). */
+function prepareTracking() {
+  buildTrackGroups();
+  if (!state.trackGroups) {
+    state.trackingActive = false;
+    return;
+  }
+  loadVisitedState(generateRouteSignature());
+  state.trackingActive = true;
+}
+
+function isVisited(stopKey) {
+  return !!(state.visited[stopKey] && state.visited[stopKey].visited);
+}
+
+/** Re-render the list + markers + progress after a visited change (no recompute). */
+function afterVisitedChange() {
+  if (state.groups) renderGroups();
+  else if (state.lastResult) renderResults(state.lastResult);
+  updateAllMarkers();
+  renderVisitedProgress();
+}
+
+function markStopVisited(stopKey) {
+  state.visited[stopKey] = { visited: true, visitedAt: new Date().toISOString() };
+  saveVisitedState();
+  afterVisitedChange();
+}
+
+function undoStopVisited(stopKey) {
+  delete state.visited[stopKey];
+  saveVisitedState();
+  afterVisitedChange();
+}
+
+function markRouteVisited(clusterIndex) {
+  const group = trackGroupByIndex(clusterIndex);
+  if (!group) return;
+  const now = new Date().toISOString();
+  group.stops.forEach((s) => {
+    state.visited[getStopKey(clusterIndex, s)] = { visited: true, visitedAt: now };
+  });
+  saveVisitedState();
+  afterVisitedChange();
+}
+
+function resetRouteProgress(clusterIndex) {
+  const group = trackGroupByIndex(clusterIndex);
+  if (!group) return;
+  group.stops.forEach((s) => delete state.visited[getStopKey(clusterIndex, s)]);
+  saveVisitedState();
+  afterVisitedChange();
+}
+
+/** Clear progress for the current route only (keeps the calculated route). */
+function clearProgressForThisRoute() {
+  state.visited = {};
+  saveVisitedState();
+  afterVisitedChange();
+}
+
+/** Clear visited progress for every route stored in this browser. */
+function clearAllVisitedProgress() {
+  try {
+    Object.keys(localStorage)
+      .filter((k) => k.indexOf("visitedStops:") === 0)
+      .forEach((k) => localStorage.removeItem(k));
+  } catch (e) { /* ignore */ }
+  state.visited = {};
+  afterVisitedChange();
+}
+
+function getGlobalProgress() {
+  let total = 0, visited = 0;
+  (state.trackGroups || []).forEach((g) => {
+    g.stops.forEach((s) => {
+      total++;
+      if (isVisited(getStopKey(g.clusterIndex, s))) visited++;
+    });
+  });
+  return { total, visited, remaining: total - visited,
+           pct: total ? Math.round((visited / total) * 100) : 0 };
+}
+
+function getRouteGroupProgress(group) {
+  let visited = 0;
+  group.stops.forEach((s) => {
+    if (isVisited(getStopKey(group.clusterIndex, s))) visited++;
+  });
+  const total = group.stops.length;
+  return { total, visited, pct: total ? Math.round((visited / total) * 100) : 0,
+           complete: total > 0 && visited === total };
+}
+
+/** First unvisited stop by route-group order then stop order, or null. */
+function getNextUnvisitedStop() {
+  for (const g of (state.trackGroups || [])) {
+    for (const s of g.stops) {
+      const key = getStopKey(g.clusterIndex, s);
+      if (!isVisited(key)) {
+        return { clusterIndex: g.clusterIndex, title: g.title, stop: s, key };
+      }
+    }
+  }
+  return null;
+}
+
+function progressBar(pct) {
+  return '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>';
+}
+
+/** Per-route progress block + "Mark entire route visited" / "Reset" buttons. */
+function buildRouteVisitedControls(group) {
+  const p = getRouteGroupProgress(group);
+  const wrap = document.createElement("div");
+  wrap.className = "route-progress";
+
+  const line = document.createElement("div");
+  line.className = "progress-line";
+  line.innerHTML = "<span>" + p.visited + " / " + p.total + " visited</span>" +
+    (p.complete ? "<span class='done-tag'>Route completed</span>" : "");
+
+  const bar = document.createElement("div");
+  bar.innerHTML = progressBar(p.pct);
+
+  const acts = document.createElement("div");
+  acts.className = "route-progress-actions";
+  const markAll = document.createElement("button");
+  markAll.className = "icon-btn";
+  markAll.textContent = "Mark entire route visited";
+  markAll.onclick = () => markRouteVisited(group.clusterIndex);
+  const reset = document.createElement("button");
+  reset.className = "icon-btn";
+  reset.textContent = "Reset route progress";
+  reset.onclick = () => resetRouteProgress(group.clusterIndex);
+  acts.append(markAll, reset);
+
+  wrap.append(line, bar.firstChild, acts);
+  return wrap;
+}
+
+/** Render the global progress summary + Next Stop section. */
+function renderVisitedProgress() {
+  if (!state.trackingActive || !state.trackGroups) {
+    el.tracker.classList.add("hidden");
+    return;
+  }
+  el.tracker.classList.remove("hidden");
+  el.hideVisited.checked = state.hideVisited;
+  el.hideVisitedMarkers.checked = state.hideVisitedMarkers;
+
+  const gp = getGlobalProgress();
+  el.globalProgress.innerHTML =
+    '<div class="progress-line"><span>' + gp.visited + " / " + gp.total +
+    " stops visited</span><span>" + gp.pct + "% completed</span></div>" +
+    progressBar(gp.pct);
+
+  el.nextStop.innerHTML = "";
+  const next = getNextUnvisitedStop();
+  if (!next) {
+    const done = document.createElement("div");
+    done.className = "next-done";
+    done.textContent = "All stops completed.";
+    el.nextStop.append(done);
+    return;
+  }
+
+  const label = document.createElement("div");
+  label.className = "next-label";
+  label.textContent = "Next Stop";
+  const addr = document.createElement("div");
+  addr.className = "next-addr";
+  addr.textContent = next.stop.address;
+  const meta = document.createElement("div");
+  meta.className = "next-meta";
+  meta.textContent = next.title ? "in " + next.title : "";
+
+  const acts = document.createElement("div");
+  acts.className = "next-actions";
+  const waze = document.createElement("a");
+  waze.className = "waze-btn";
+  waze.href = next.stop.wazeUrl || "#";
+  waze.target = "_blank";
+  waze.rel = "noopener";
+  waze.textContent = "Open in Waze";
+  const mark = document.createElement("button");
+  mark.className = "btn btn-primary";
+  mark.textContent = "Mark visited";
+  mark.onclick = () => markStopVisited(next.key);
+  acts.append(waze, mark);
+
+  el.nextStop.append(label, addr, meta, acts);
+}
+
+/* ---------------------------------------------------------------------------
  * Misc
  * ------------------------------------------------------------------------- */
 
@@ -1202,6 +1629,19 @@ el.copyBtn.addEventListener("click", copyOptimizedOrder);
 el.copyAllBtn.addEventListener("click", copyAllRoutes);
 el.combineBtn.addEventListener("click", combineSelectedRoutes);
 el.alertClose.addEventListener("click", hideError);
+
+// Visited Stops Tracker controls.
+el.clearRouteProgressBtn.addEventListener("click", clearProgressForThisRoute);
+el.clearAllProgressBtn.addEventListener("click", clearAllVisitedProgress);
+el.hideVisited.addEventListener("change", () => {
+  state.hideVisited = el.hideVisited.checked;
+  if (state.groups) renderGroups();
+  else if (state.lastResult) renderResults(state.lastResult);
+});
+el.hideVisitedMarkers.addEventListener("change", () => {
+  state.hideVisitedMarkers = el.hideVisitedMarkers.checked;
+  updateAllMarkers();
+});
 
 // Live preview of how many stops the textarea would load.
 el.stopsInput.addEventListener("input", previewCounter);

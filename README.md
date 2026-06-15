@@ -33,6 +33,9 @@ order, see the route on a Google Map, remove cancelled stops, and re-run.
   (e.g. `2.3` = Route 2, Stop 3).
 - **Edit** or **Delete** any stop. After any change, the app requires you to **validate again** before optimizing.
 - **Copy Optimized Order** / **Copy this route** / **Copy all route groups** copy the route(s) as text.
+- **Visited Stops Tracker** — after optimizing, mark stops as visited while driving
+  (per stop, per route group, and globally) without recalculating or calling
+  Google; progress is saved in the browser (see below).
 
 Everything is held in browser memory. There is **no database** and **no login**.
 
@@ -188,7 +191,39 @@ to **approximate mode**: nearest-neighbor ordering from the start, then routing 
 
 Entering more than 50 stops returns: *"Maximum 50 stops allowed."*
 
-## 9. City restriction (avoid wrong-city matches)
+## 9. Visited Stops Tracker
+
+After a route (or route groups) is calculated, you can mark stops as **visited**
+while driving — a progress layer on top of the existing result.
+
+- **This never recalculates the route and never calls Google.** It does not call
+  `/api/optimize` or the Routes/Geocoding APIs. The optimized order stays stable —
+  a visited stop is **not** moved to the bottom.
+- Each stop row has **Mark visited** / **Undo**, a "Visited" badge, and a
+  "Visited at HH:mm" time. Visited rows are faded with a line-through; their map
+  marker turns green with a ✓ (unvisited markers keep their normal style; the
+  start marker is never marked).
+- **Per route group**: a progress bar + "X / Y visited", a "Route completed" tag
+  when done, and **Mark entire route visited** / **Reset route progress**.
+- **Global**: "12 / 50 stops visited", "24% completed", an overall bar, and a
+  **Next Stop** panel (first unvisited stop in route order, with its group, a Waze
+  button, and Mark visited) — or "All stops completed."
+- **Show/Hide**: *Hide visited stops* collapses visited rows from the list;
+  *Hide visited markers* hides them on the map. Default shows everything.
+
+### Persistence (localStorage, no database)
+
+Progress is saved only in the browser under a key derived from a **route
+signature** (start address + ordered stop addresses + group structure):
+`visitedStops:<signature>`. Because the page keeps no route in memory after a
+reload, refresh the page and **re-optimize the same addresses** — the signature
+matches and your visited marks are restored. Changing addresses, clustering, or
+re-optimizing differently produces a new signature, so old progress is never
+applied to a different route. Use **Clear progress for this route** or **Clear all
+visited progress** to reset; clearing only affects visited state, not the
+calculated route. Clearing browser storage also removes progress.
+
+## 10. City restriction (avoid wrong-city matches)
 
 Sometimes a street name exists in several cities (e.g. an address typed for
 **Ramla** can match a similar street in **Rosh HaAyin**). Enable **"Restrict
@@ -209,7 +244,7 @@ results to a specific city"**, type the city and a country code (default `IL`):
 **Strict city match** (on by default) blocks optimization until every mismatch is
 fixed. Turn strict off to allow optimization with a visible warning instead.
 
-## 10. Re-validation rules
+## 11. Re-validation rules
 
 Validation is marked **stale** (and Optimize is disabled) whenever you change the
 **start address**, any **stop**, or the **city restriction** — anything that
@@ -218,12 +253,14 @@ affects geocoding. Changing **clustering settings**, the **route mode**, or usin
 unchanged); it only marks the *optimization* as stale — just press **Optimize
 Route** again to recalculate.
 
-## 11. No database — data resets on reload
+## 12. No database — data resets on reload
 
 There is no database, no accounts, and no server-side storage. All addresses and
-results live in the browser tab. **Reloading the page clears everything.**
+results live in the browser tab. **Reloading the page clears everything** except
+Visited Stops Tracker progress, which is kept in `localStorage` and re-applied
+when you re-optimize the same route (see section 9).
 
-## 12. Restrict your API keys before deploying publicly
+## 13. Restrict your API keys before deploying publicly
 
 This MVP exposes the Maps JavaScript key to the browser via `/api/config`, which
 is fine for **local** use. Before any public deployment:

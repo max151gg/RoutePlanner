@@ -156,6 +156,25 @@
 
       <div id="warnings" class="warnings hidden"></div>
 
+      <!-- Visited Stops Tracker (progress layer; no recalculation) -->
+      <div id="tracker" class="tracker hidden">
+        <div class="tracker-head">
+          <h2>Progress</h2>
+          <div class="tracker-actions">
+            <label class="check inline">
+              <input type="checkbox" id="hideVisited" /><span>Hide visited stops</span>
+            </label>
+            <label class="check inline">
+              <input type="checkbox" id="hideVisitedMarkers" /><span>Hide visited markers</span>
+            </label>
+            <button id="clearRouteProgressBtn" class="btn btn-ghost">Clear progress for this route</button>
+            <button id="clearAllProgressBtn" class="btn btn-ghost">Clear all visited progress</button>
+          </div>
+        </div>
+        <div id="globalProgress" class="global-progress"></div>
+        <div id="nextStop" class="next-stop"></div>
+      </div>
+
       <!-- Single (non-clustered) result -->
       <div id="results" class="results hidden">
         <div class="results-head">
