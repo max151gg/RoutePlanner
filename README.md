@@ -1,0 +1,295 @@
+# Route Optimizer Lite
+
+A tiny, no-database web app for planning a multi-stop driving route. Paste a
+starting address and a list of stops, validate them, optimize the visiting
+order, see the route on a Google Map, remove cancelled stops, and re-run.
+
+## 1. What the app does
+
+- Enter a **starting address** and up to **50 stop addresses** (one per line). A
+  live **"Stops: X / 50"** counter sits next to the textarea and updates as you
+  load, edit, or delete stops.
+- **Validate Addresses** — geocodes every address and shows a status badge:
+  - 🟢 **Found** — precise match.
+  - 🟡 **Ambiguous** — partial / broad match (city, region, postal code). Allowed, but shows the address Google matched.
+  - 🟠 **City mismatch** — Google matched a different city than the one you required (see City restriction below). Blocks optimization in strict mode.
+  - 🔴 **Not found** — must be fixed or deleted before optimizing.
+  - ⚪ **Not validated** — not checked yet.
+- **Optimize Route** — computes the best driving order in one of two modes:
+  - **Return to start** — origin and destination are the start; all stops are optimized intermediates.
+  - **End anywhere** — the app picks the best final stop (see notes below).
+- **Split into route groups (clustering)** — divide many stops into several
+  geographically-grouped routes, each optimized separately. Modes: *stops per
+  route*, *number of routes*, or **auto cluster by distance** (the app decides how
+  many groups based on how far apart the stops are). You can then **combine** or
+  **separate** groups by hand and re-optimize (see below).
+- **Restrict addresses to city** — force validation to a specific city/country so
+  a stop typed for one city does not silently match a similar street elsewhere.
+- Shows total **distance (km)**, **duration (h/m)**, whether **exact**,
+  **approximate**, or **clustered** optimization was used, the **ordered stop
+  list(s)**, and a **"Open in Waze"** deep link per stop.
+- Draws **markers + the route polyline(s)** on a Google Map and fits the view to
+  the route. Clustered routes get distinct colors and `route.stop` marker labels
+  (e.g. `2.3` = Route 2, Stop 3).
+- **Edit** or **Delete** any stop. After any change, the app requires you to **validate again** before optimizing.
+- **Copy Optimized Order** / **Copy this route** / **Copy all route groups** copy the route(s) as text.
+
+Everything is held in browser memory. There is **no database** and **no login**.
+
+## 2. Enable the Google APIs
+
+In the [Google Cloud Console](https://console.cloud.google.com/), create (or pick)
+a project and enable these three APIs:
+
+1. **Maps JavaScript API** — renders the map in the browser.
+2. **Routes API** — computes and optimizes the route (`computeRoutes`).
+3. **Geocoding API** — converts/validates addresses into coordinates.
+
+Then create an **API key** under *APIs & Services → Credentials*. One key can be
+used for all three for local development.
+
+## 3. Create your `.env`
+
+Copy the example and paste your key:
+
+```bash
+# Windows (PowerShell)
+copy .env.example .env
+
+# macOS / Linux
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```
+GOOGLE_MAPS_API_KEY=your_real_key_here
+```
+
+## 4. Install
+
+```bash
+python -m venv venv
+
+# Windows
+venv\Scripts\activate
+
+# macOS / Linux
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+## 5. Run
+
+```bash
+python app.py
+```
+
+## 6. Open
+
+Visit: <http://127.0.0.1:5000>
+
+## 7. The 25-intermediate-waypoint optimization limit
+
+Google Routes API can optimize the order of **up to 25 intermediate waypoints**
+per request (origin and destination are always fixed). So:
+
+- **Return to start**: up to **25 stops** are optimized exactly by Google.
+- **End anywhere**:
+  - **1–10 stops** — the app tries *each* stop as the final destination, optimizes the rest as intermediates, and keeps the route with the lowest duration (distance as a tie-breaker).
+  - **11–25 stops** — the app uses a heuristic: the stop **farthest from the start** (straight-line Haversine distance) becomes the destination, and the rest are optimized intermediates.
+
+## 8. 26–50 stops: clustering vs. approximate mode
+
+The app cap is **50 stops**, but ComputeRoutes optimizes at most **25
+intermediate waypoints per request**, so a single exact route is impossible
+beyond 25 stops. There are two ways to handle a large list:
+
+### Clustering (recommended) — "Split into route groups"
+
+Choose one of:
+
+- **Cluster by stops per route** — you set how many stops each route should
+  contain. The backend uses **greedy nearest-neighbor chunking** so each group is
+  geographically compact. Example: 47 stops, 5 per route → 10 groups (9 × 5 + 1 × 2).
+- **Cluster by number of routes** — you set how many route groups you want. The
+  backend uses a **simple, dependency-free k-means** on latitude/longitude.
+  Example: 50 stops, 10 groups → ~5 stops each.
+- **Auto cluster by distance** — the app decides the number of route groups from
+  how far apart the stops are (see below).
+
+Then each cluster is optimized **separately** with ComputeRoutes, all starting
+from the same start address, honoring the selected route mode (return to start /
+end anywhere). Every cluster is capped at **25 stops**; if one would exceed that,
+it is split automatically and the UI warns you.
+
+> Clustering is **approximate geographic grouping**, not perfect multi-vehicle
+> logistics optimization (no true VRP). It is fast, deterministic, and good
+> enough for splitting a delivery list into sensible daily/driver routes.
+
+### Auto cluster by distance
+
+This mode does **not** ask you for a fixed number of stops or routes. Instead it
+looks at the geographic distance between stops and decides how many route groups
+make sense:
+
+- **Recommended stops per route** (default 5) is a **soft target**, not a hard
+  rule. Geographic closeness comes first; the target only keeps groups from being
+  absurdly huge or tiny.
+- **Distance sensitivity**: *Compact* (more, smaller groups), *Balanced*
+  (default), or *Wide* (lets farther stops stay together).
+- **Auto-combine small nearby routes** (default on) merges a lonely single-stop
+  group into its nearest group when that still makes route sense.
+- **Max stops per route** (default 25) — never exceeded, because of the Google
+  limit.
+
+Under the hood it uses **DBSCAN** (from scikit-learn) with the **Haversine**
+metric. DBSCAN groups by density/distance and **does not require you to choose the
+number of clusters in advance** — that is exactly why it fits "let the app
+decide." The search radius (`eps`) is derived from the data (median
+nearest-neighbor distance) and the chosen sensitivity, converted to radians
+(`eps_radians = eps_km / 6371.0088`), with `min_samples=1` so every stop is
+placed. Clusters are then **post-processed**: oversized groups are split with
+nearest-neighbor chunking, and tiny groups may be merged — so no group exceeds 25
+stops and sizes stay practical.
+
+Example: 5 stops where 3 are in one city and 2 are far away in another → Auto
+Cluster creates **2 route groups**, not one route of 5. The response includes a
+short `clusterReason` per group and an `autoClusterSummary` explaining the count.
+
+**Fallback:** if scikit-learn is not installed, the app uses a simple greedy
+distance-grouping algorithm instead and shows: *"Using fallback auto-clustering
+because scikit-learn is unavailable."* (Install it via `requirements.txt` to get
+DBSCAN.)
+
+### Adjust groups manually — Combine / Separate
+
+Auto grouping is a starting point. On each route-group card you can:
+
+- **Select route** (checkbox) on two or more cards, then **Combine selected
+  routes** to merge them into one group — blocked if the result would exceed 25
+  stops.
+- **Separate this route** (shown when a group has ≥ 4 stops) to split it into two
+  geographically close halves (simple 2-means in the browser).
+
+Combining or separating changes the groups **locally** (no database) and marks the
+result as needing re-optimization. Click **Optimize Route** again to recompute the
+modified groups — the frontend then sends them to the backend as clustering
+`mode: "manual"` with the exact stop groupings.
+
+### Approximate mode (no clustering, > 25 stops)
+
+If you leave clustering off and still have more than 25 stops, the app falls back
+to **approximate mode**: nearest-neighbor ordering from the start, then routing in
+≤ 25-waypoint chunks, combining totals approximately. The UI warns:
+
+> Approximate mode: Google optimized routing supports up to 25 intermediate stops per request.
+
+Entering more than 50 stops returns: *"Maximum 50 stops allowed."*
+
+## 9. City restriction (avoid wrong-city matches)
+
+Sometimes a street name exists in several cities (e.g. an address typed for
+**Ramla** can match a similar street in **Rosh HaAyin**). Enable **"Restrict
+results to a specific city"**, type the city and a country code (default `IL`):
+
+- Before geocoding, the city/country are appended to each query when missing
+  (e.g. `Ben Gurion 5` → `Ben Gurion 5, Ramla, Israel`), and a
+  `components=country:XX` filter is applied.
+- After geocoding, the **matched city** is read from Google's
+  `address_components` (`locality` / `postal_town` / `administrative_area_level_2`,
+  with fallbacks) and compared to the requested city. Comparison is
+  normalized (lowercase, punctuation stripped) and uses a small Hebrew/English
+  **alias table** (Ramla/רמלה, Tel Aviv/תל אביב/Tel Aviv-Yafo, Jerusalem/ירושלים,
+  Rishon LeZion, Petah Tikva, Rosh HaAyin, …).
+- On mismatch the address is marked **`city_mismatch`** with a message like:
+  *"Requested city: Ramla. Google matched: Rosh HaAyin."*
+
+**Strict city match** (on by default) blocks optimization until every mismatch is
+fixed. Turn strict off to allow optimization with a visible warning instead.
+
+## 10. Re-validation rules
+
+Validation is marked **stale** (and Optimize is disabled) whenever you change the
+**start address**, any **stop**, or the **city restriction** — anything that
+affects geocoding. Changing **clustering settings**, the **route mode**, or using
+**Combine / Separate** does **not** require re-validation (addresses are
+unchanged); it only marks the *optimization* as stale — just press **Optimize
+Route** again to recalculate.
+
+## 11. No database — data resets on reload
+
+There is no database, no accounts, and no server-side storage. All addresses and
+results live in the browser tab. **Reloading the page clears everything.**
+
+## 12. Restrict your API keys before deploying publicly
+
+This MVP exposes the Maps JavaScript key to the browser via `/api/config`, which
+is fine for **local** use. Before any public deployment:
+
+- Restrict the **browser key** by **HTTP referrer** (your domain) and to only the
+  *Maps JavaScript API*.
+- Use a **separate server key** for Geocoding / Routes, restricted by **API**
+  (and IP if possible), and keep it server-side only.
+- Add **billing alerts / quotas** to avoid surprise usage.
+
+## API assumptions
+
+- Geocoding "ambiguous" is inferred from Google's `partial_match` flag or when the
+  best result is only a broad type (country, region, locality, postal code, route)
+  with no precise type (street address, premise, establishment, etc.).
+- "City mismatch" compares the matched `locality`/`postal_town`/admin-area against
+  the requested city using a normalized comparison + a small alias table. It is a
+  best-effort guard, not a guarantee — keep an eye on ambiguous results too.
+- Stop coordinates for markers/Waze come from a backend geocode during `/api/optimize`
+  (reused across every cluster, so the optimizer geocodes each stop once per run).
+  Exact duplicate stop lines (case-insensitive) and empty lines are removed.
+- Clustering uses straight-line (Haversine) distance for grouping only; the actual
+  per-route distances/durations come from real ComputeRoutes calls.
+- scikit-learn + numpy are **optional**. With them, Auto Cluster uses DBSCAN;
+  without them it uses the built-in greedy fallback (and warns).
+- `routingPreference: TRAFFIC_AWARE` is used; durations reflect typical traffic.
+
+### `/api/optimize` request — `clustering` shapes
+
+```jsonc
+// stops per route
+"clustering": { "enabled": true, "mode": "stops_per_route", "stopsPerRoute": 5 }
+
+// number of routes
+"clustering": { "enabled": true, "mode": "number_of_routes", "numberOfRoutes": 10 }
+
+// auto cluster by distance
+"clustering": { "enabled": true, "mode": "auto_distance",
+                "recommendedStopsPerRoute": 5, "distanceSensitivity": "balanced",
+                "autoCombineSmallRoutes": true, "maxStopsPerRoute": 25 }
+
+// manual (after Combine/Separate) — arrays of original stop indexes
+"clustering": { "enabled": true, "mode": "manual",
+                "manualClusters": [[0, 2, 4], [1, 3]] }
+```
+
+A clustered response has `mode: "clustered"`, `clusterMode` (the mode used), a
+`clusters` array (each with `clusterIndex`, `title`, `stopCount`, totals,
+`encodedPolylines`, `orderedStops`; auto mode adds `clusterReason` and
+`averageDistanceFromClusterCenterKm`), `grandTotal*` fields, a `warnings` array,
+and — for auto mode — an `autoClusterSummary`. Non-clustered runs keep the original
+single-route shape (`orderedStops` + totals at the top level), so both are
+supported. Manual clusters are validated: every stop index must appear exactly
+once and no group may exceed 25 stops.
+
+## Project structure
+
+```
+.
+├── app.py               # Flask backend + Google API helpers
+├── requirements.txt     # flask, requests, python-dotenv, scikit-learn, numpy
+├── .env.example         # copy to .env and add your key
+├── templates/
+│   └── index.html       # single-page UI
+├── static/
+│   ├── styles.css       # dark theme
+│   └── app.js           # all frontend logic (state, validation, map)
+└── README.md
+```

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Route Optimizer Lite</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+  <!-- Full-screen loading overlay (validate / optimize) -->
+  <div id="loading" class="loading hidden">
+    <div class="spinner"></div>
+    <div id="loadingText">Working…</div>
+  </div>
+
+  <header class="header">
+    <h1>Route Optimizer Lite</h1>
+    <p class="subtitle">Paste stops, optimize the drive, remove cancelled stops.</p>
+  </header>
+
+  <!-- Styled alert / error box -->
+  <div id="alert" class="alert hidden">
+    <span id="alertText"></span>
+    <button id="alertClose" class="alert-close" aria-label="Dismiss">&times;</button>
+  </div>
+
+  <main class="layout">
+    <!-- LEFT: controls -->
+    <section class="panel">
+      <label class="field-label" for="startAddress">Starting address</label>
+      <input id="startAddress" type="text" class="text-input"
+             placeholder="e.g. Herzl 1, Ramla" />
+
+      <fieldset class="mode">
+        <legend>Route mode</legend>
+        <label class="radio">
+          <input type="radio" name="mode" value="return" checked />
+          <span>Return to start</span>
+        </label>
+        <label class="radio">
+          <input type="radio" name="mode" value="anywhere" />
+          <span>End anywhere</span>
+        </label>
+      </fieldset>
+
+      <!-- City restriction -->
+      <fieldset class="mode">
+        <legend>Restrict addresses to city</legend>
+        <label class="check">
+          <input type="checkbox" id="cityEnabled" />
+          <span>Restrict results to a specific city</span>
+        </label>
+        <div id="cityFields" class="city-fields">
+          <div class="city-row">
+            <input id="cityName" type="text" class="text-input" placeholder="City name (e.g. Ramla)" />
+            <input id="cityCountry" type="text" class="text-input country" value="IL" placeholder="Country" />
+          </div>
+          <label class="check">
+            <input type="checkbox" id="cityStrict" checked />
+            <span>Strict city match (block optimization on mismatch)</span>
+          </label>
+        </div>
+      </fieldset>
+
+      <!-- Clustering -->
+      <fieldset class="mode">
+        <legend>Split into route groups</legend>
+        <label class="radio block">
+          <input type="radio" name="cluster" value="none" checked />
+          <span>No clustering (one route)</span>
+        </label>
+        <label class="radio block">
+          <input type="radio" name="cluster" value="spr" />
+          <span>Cluster by stops per route</span>
+        </label>
+        <div id="sprWrap" class="cluster-input hidden">
+          <input id="stopsPerRoute" type="number" class="text-input small" min="1" max="25" value="5" />
+          <span class="hint">stops per route (max 25)</span>
+        </div>
+        <label class="radio block">
+          <input type="radio" name="cluster" value="nor" />
+          <span>Cluster by number of routes</span>
+        </label>
+        <div id="norWrap" class="cluster-input hidden">
+          <input id="numberOfRoutes" type="number" class="text-input small" min="1" max="50" value="5" />
+          <span class="hint">route groups</span>
+        </div>
+
+        <label class="radio block">
+          <input type="radio" name="cluster" value="auto" />
+          <span>Auto cluster by distance</span>
+        </label>
+        <div id="autoWrap" class="cluster-input-block hidden">
+          <p class="hint">Auto Cluster groups stops that are close to each other.
+            The recommended stops value is only a guide. If the app detects that
+            some stops are far away from the others, it may create separate routes.</p>
+
+          <label class="sub-field">Recommended stops per route
+            <input id="autoRecommended" type="number" class="text-input small" min="2" max="25" value="5" />
+          </label>
+
+          <label class="sub-field">Distance sensitivity
+            <select id="distanceSensitivity" class="text-input small select">
+              <option value="compact">Compact</option>
+              <option value="balanced" selected>Balanced</option>
+              <option value="wide">Wide</option>
+            </select>
+          </label>
+          <span class="hint">Compact = more, smaller groups · Balanced = normal ·
+            Wide = farther stops can stay together.</span>
+
+          <label class="check">
+            <input type="checkbox" id="autoCombine" checked />
+            <span>Auto-combine small nearby routes</span>
+          </label>
+          <span class="hint">Merge very small nearby groups when it still makes route sense.</span>
+
+          <label class="sub-field">Max stops per route
+            <input id="autoMaxStops" type="number" class="text-input small" min="2" max="25" value="25" />
+          </label>
+        </div>
+
+        <label class="check disabled-check">
+          <input type="checkbox" id="sameStart" checked disabled />
+          <span>Each route starts from the same starting address</span>
+        </label>
+      </fieldset>
+
+      <div class="textarea-head">
+        <label class="field-label" for="stopsInput">Paste one stop address per line</label>
+        <span id="stopCounter" class="counter">Stops: 0 / 50</span>
+      </div>
+      <textarea id="stopsInput" class="text-area" rows="6"
+                placeholder="Herzl 10, Ramla&#10;Bialik 5, Ramla&#10;…"></textarea>
+
+      <div class="button-row">
+        <button id="loadBtn" class="btn">Load Stops</button>
+        <button id="validateBtn" class="btn">Validate Addresses</button>
+        <button id="optimizeBtn" class="btn btn-primary" disabled>Optimize Route</button>
+        <button id="clearBtn" class="btn btn-ghost">Clear</button>
+      </div>
+
+      <div class="status-row">
+        <span class="status-label">Status:</span>
+        <span id="statusPill" class="pill pill-gray">Not validated</span>
+      </div>
+
+      <div id="stopsList" class="stops-list"></div>
+    </section>
+
+    <!-- RIGHT: map + results -->
+    <section class="panel">
+      <div id="map" class="map">
+        <div id="mapMessage" class="map-message">Map will appear here.</div>
+      </div>
+
+      <div id="warnings" class="warnings hidden"></div>
+
+      <!-- Single (non-clustered) result -->
+      <div id="results" class="results hidden">
+        <div class="results-head">
+          <h2>Optimized route</h2>
+          <button id="copyBtn" class="btn btn-ghost">Copy Optimized Order</button>
+        </div>
+        <div id="resultSummary" class="summary"></div>
+        <ol id="orderedList" class="ordered-list"></ol>
+      </div>
+
+      <!-- Clustered result -->
+      <div id="routeGroups" class="route-groups hidden">
+        <div class="results-head">
+          <h2>Route Groups</h2>
+          <div class="head-actions">
+            <button id="combineBtn" class="btn btn-ghost">Combine selected routes</button>
+            <button id="copyAllBtn" class="btn btn-ghost">Copy all route groups</button>
+          </div>
+        </div>
+        <p class="hint">You can adjust the automatic groups manually. Combining or
+          separating routes requires re-optimizing before navigation.</p>
+        <div id="autoSummary" class="auto-summary hidden"></div>
+        <div id="manualNote" class="manual-note hidden"></div>
+        <div id="grandSummary" class="summary"></div>
+        <div id="groupCards" class="group-cards"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
