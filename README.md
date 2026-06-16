@@ -36,6 +36,12 @@ order, see the route on a Google Map, remove cancelled stops, and re-run.
 - **Visited Stops Tracker** — after optimizing, mark stops as visited while driving
   (per stop, per route group, and globally) without recalculating or calling
   Google; progress is saved in the browser (see below).
+- **Save / share without a database** — automatic local autosave + restore,
+  **Export / Import** route files (`.json`) for sharing between devices/users
+  (including visited progress, no API keys), and an optional named local route
+  library.
+- **Min/max stops per route** — constrain clustering so each group has between a
+  minimum and maximum number of stops (never above 25).
 
 Everything is held in browser memory. There is **no database** and **no login**.
 
@@ -223,7 +229,79 @@ applied to a different route. Use **Clear progress for this route** or **Clear a
 visited progress** to reset; clearing only affects visited state, not the
 calculated route. Clearing browser storage also removes progress.
 
-## 10. City restriction (avoid wrong-city matches)
+## 10. Saving, sharing, export & import (no database)
+
+There is **no database** and **no server storage**. Routes are saved two ways,
+both entirely in the browser / as files:
+
+### Local autosave (same browser)
+
+As you work, the app automatically saves the whole session to `localStorage`
+under `routeOptimizerLite:lastSession` — start address, stops, validation
+results, route mode, city restriction, clustering settings (including min/max),
+the optimization result, route groups, visited progress, and the show/hide
+toggles. On the next visit a banner appears — **"A saved local session was
+found."** — with **Restore / Ignore / Delete saved session**. The **Save & share**
+section also has **Restore last session** and **Clear saved session**. Restoring
+redraws the map, route cards, group cards, progress bars, visited badges, the
+Next Stop panel, Waze buttons and copy buttons **without calling Google**, as long
+as the saved result includes coordinates and encoded polylines. If the saved data
+has no optimization result, the form is restored and you're asked to click
+**Optimize Route**. Local saves live only in that browser/device — they are not a
+database and don't sync between users.
+
+### Export / import a route file (sharing between devices/users)
+
+- **Export Route File** downloads a JSON file (e.g.
+  `route-optimizer-lite-2026-06-16.json`) containing everything needed to restore
+  the route — addresses, settings, the optimized order, clusters, polylines,
+  totals, **visited progress**, and min/max settings. The whole file is generated
+  in the browser; nothing is sent to a server and **no API keys or secrets are
+  included**.
+- **Import Route File** reads a previously exported `.json` and restores it. The
+  file is validated (`appName`, `schemaVersion`, required fields); an invalid file
+  shows **"Invalid route file."** A valid file with an optimization result is
+  redrawn from its saved data — **no Google calls** — and shows **"Route file
+  imported and restored."** A file without a result restores the form and shows
+  **"Route file imported. Click Optimize Route to calculate the route."**
+- Sharing: one user exports a file and sends it to another, who imports it and
+  sees the same addresses, route groups, map lines, Waze links (rebuilt from saved
+  coordinates) and visited progress.
+- Safety: imported JSON is treated as **data only** — never executed, rendered via
+  safe text methods, with Waze links rebuilt from coordinates (never trusted from
+  the file). Files from older versions missing min/max fields import fine using
+  defaults.
+
+### Save named routes locally (optional library)
+
+In **Save & share**, type a name and click **Save route locally** to keep a route
+under `routeOptimizerLite:savedRoutes`. The **Saved Routes** list shows each
+route's name, date, stop count and mode, with **Load / Export / Delete**. These
+are stored only in this browser.
+
+## 11. Min/max stops per route
+
+Independently of the clustering mode, tick **Use min/max stops per route** and set
+**Minimum** and **Maximum**. After the initial clustering, the backend
+post-processes the groups so each one falls within `[min, max]` when practical:
+oversized groups are split into balanced, geographically-ordered chunks;
+under-min groups are merged into the nearest compatible group; and, if needed,
+the nearest stops are moved between groups.
+
+Rules: min ≥ 1, max ≤ 25, and min ≤ max — invalid combinations are blocked with a
+clear error. No group may ever exceed 25 (Google's intermediate-waypoint limit).
+The constraints apply to *stops per route*, *number of routes*, and *auto cluster
+by distance*; manual groups are kept as-is but **warn** if outside the range.
+
+Examples (min = 5, max = 6): 50 → groups of 6 and 5; 23 → 6, 6, 6, 5; 12 → 6, 6;
+11 → 6, 5. When the total makes it impossible (e.g. 9 stops → 5, 4) the app keeps
+the best practical result and warns: *"Could not satisfy minimum stops for every
+route because of the total number of stops."* A route card shows a **Below min** /
+**Above max** badge when a group is out of range, and the response includes a
+`clusterSizeSummary` (`allClustersWithinMin` / `allClustersWithinMax`). Export and
+import preserve the min/max settings and the summary.
+
+## 12. City restriction (avoid wrong-city matches)
 
 Sometimes a street name exists in several cities (e.g. an address typed for
 **Ramla** can match a similar street in **Rosh HaAyin**). Enable **"Restrict
@@ -244,7 +322,7 @@ results to a specific city"**, type the city and a country code (default `IL`):
 **Strict city match** (on by default) blocks optimization until every mismatch is
 fixed. Turn strict off to allow optimization with a visible warning instead.
 
-## 11. Re-validation rules
+## 13. Re-validation rules
 
 Validation is marked **stale** (and Optimize is disabled) whenever you change the
 **start address**, any **stop**, or the **city restriction** — anything that
@@ -253,14 +331,18 @@ affects geocoding. Changing **clustering settings**, the **route mode**, or usin
 unchanged); it only marks the *optimization* as stale — just press **Optimize
 Route** again to recalculate.
 
-## 12. No database — data resets on reload
+## 14. No database — data resets on reload
 
 There is no database, no accounts, and no server-side storage. All addresses and
-results live in the browser tab. **Reloading the page clears everything** except
-Visited Stops Tracker progress, which is kept in `localStorage` and re-applied
-when you re-optimize the same route (see section 9).
+results live in the browser tab. Reloading clears the in-memory working state, but
+the app keeps three things in `localStorage` (this browser only): the autosaved
+session (`routeOptimizerLite:lastSession`), named saved routes
+(`routeOptimizerLite:savedRoutes`), and Visited Stops Tracker progress
+(`visitedStops:<routeSignature>`). On reload, restore via the banner / **Restore
+last session**, or import a route file. Clearing browser storage removes all of
+these.
 
-## 13. Restrict your API keys before deploying publicly
+## 15. Restrict your API keys before deploying publicly
 
 This MVP exposes the Maps JavaScript key to the browser via `/api/config`, which
 is fine for **local** use. Before any public deployment:

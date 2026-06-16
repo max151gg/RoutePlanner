@@ -996,6 +996,161 @@ def _build_manual_clusters(stop_objs, manual_clusters):
     return clusters
 
 
+# --- Min / max stops-per-route constraints -----------------------------------
+
+def validate_cluster_size_constraints(total_stops, min_stops, max_stops):
+    """
+    Hard-validate min/max (raises RouteError on invalid config). Returns whether
+    the constraints are mathematically satisfiable for `total_stops`.
+    """
+    if min_stops < 1:
+        raise RouteError("Minimum stops per route must be at least 1.")
+    if max_stops > MAX_CLUSTER_SIZE:
+        raise RouteError("Maximum stops per route cannot exceed 25.")
+    if min_stops > max_stops:
+        raise RouteError("Minimum stops per route cannot be greater than the maximum.")
+    if total_stops <= 0:
+        return True
+    groups = max(1, math.ceil(total_stops / max_stops))
+    return groups * min_stops <= total_stops
+
+
+def _nn_order(stops):
+    """Nearest-neighbor visiting order over a list of stop objects."""
+    remaining = sorted(stops, key=lambda s: (s["lng"], s["lat"]))
+    order = [remaining.pop(0)]
+    cur = order[0]
+    while remaining:
+        nxt = min(remaining, key=lambda s: _hav(cur, s))
+        remaining.remove(nxt)
+        order.append(nxt)
+        cur = nxt
+    return order
+
+
+def _balanced_sizes(n, max_stops):
+    """Split count `n` into the fewest groups each <= max_stops, as evenly as possible."""
+    groups = max(1, math.ceil(n / max_stops))
+    base, rem = divmod(n, groups)
+    return [base + 1] * rem + [base] * (groups - rem)
+
+
+def balanced_size_clusters(stops, min_stops, max_stops):
+    """
+    Group all stops into the fewest groups (ceil(n/max)) of balanced sizes, each
+    <= max and >= min when feasible. Stops are ordered by a nearest-neighbor tour
+    first, so each group stays geographically contiguous. Deterministic.
+    Examples (min 5, max 6): 23 -> 6,6,6,5 ; 11 -> 6,5 ; 50 -> 6x5 + 5x4.
+    """
+    if not stops:
+        return []
+    order = _nn_order(stops)
+    out, i = [], 0
+    for size in _balanced_sizes(len(stops), max_stops):
+        out.append(order[i:i + size])
+        i += size
+    return out
+
+
+def split_clusters_above_max(clusters, max_stops):
+    """Split any cluster larger than max into balanced, geographically-ordered chunks."""
+    out = []
+    for cluster in clusters:
+        if len(cluster) <= max_stops:
+            out.append(cluster)
+            continue
+        order = _nn_order(cluster)
+        i = 0
+        for size in _balanced_sizes(len(cluster), max_stops):
+            out.append(order[i:i + size])
+            i += size
+    return out
+
+
+def merge_clusters_below_min(clusters, min_stops, max_stops, distance_sensitivity):
+    """Merge under-min clusters into the nearest cluster when the result fits max."""
+    clusters = [list(c) for c in clusters]
+    changed = True
+    while changed:
+        changed = False
+        small = [i for i, c in enumerate(clusters) if len(c) < min_stops]
+        if not small:
+            break
+        i = min(small, key=lambda idx: len(clusters[idx]))
+        best_j, best_d = None, None
+        for j, other in enumerate(clusters):
+            if j == i:
+                continue
+            if len(clusters[i]) + len(other) <= max_stops:
+                d = cluster_center_distance_km(clusters[i], other)
+                if best_d is None or d < best_d:
+                    best_d, best_j = d, j
+        if best_j is not None:
+            clusters[best_j].extend(clusters[i])
+            clusters.pop(i)
+            changed = True
+    return clusters
+
+
+def rebalance_cluster_sizes(clusters, min_stops, max_stops):
+    """
+    Move the nearest stops from over-min donor clusters into under-min clusters,
+    without pushing any donor below min or any receiver above max.
+    """
+    clusters = [list(c) for c in clusters]
+    for _ in range(200):  # bounded
+        deficient = [i for i, c in enumerate(clusters) if len(c) < min_stops]
+        if not deficient:
+            break
+        moved = False
+        for i in deficient:
+            donors = [j for j, c in enumerate(clusters)
+                      if j != i and len(c) > min_stops]
+            donors.sort(key=lambda j: cluster_center_distance_km(clusters[i], clusters[j]))
+            for j in donors:
+                while (len(clusters[i]) < min_stops and len(clusters[i]) < max_stops
+                       and len(clusters[j]) > min_stops):
+                    center_i = cluster_center(clusters[i])
+                    stop = min(clusters[j], key=lambda s: haversine_distance(
+                        center_i["lat"], center_i["lng"], s["lat"], s["lng"]))
+                    clusters[j].remove(stop)
+                    clusters[i].append(stop)
+                    moved = True
+                if len(clusters[i]) >= min_stops:
+                    break
+        if not moved:
+            break
+    return clusters
+
+
+def apply_cluster_size_constraints(clusters, min_stops, max_stops, distance_sensitivity):
+    """Post-process clusters so each group falls within [min, max] when practical."""
+    clusters = split_clusters_above_max(clusters, max_stops)
+    clusters = merge_clusters_below_min(clusters, min_stops, max_stops, distance_sensitivity)
+    clusters = rebalance_cluster_sizes(clusters, min_stops, max_stops)
+    clusters = split_clusters_above_max(clusters, max_stops)  # safety re-split
+    return [c for c in clusters if c]
+
+
+def _cluster_size_summary(clusters, min_stops, max_stops, warnings, add_warnings=True):
+    """Build the clusterSizeSummary block and (optionally) append min/max warnings."""
+    all_within_max = all(len(c) <= max_stops for c in clusters)
+    all_within_min = all(len(c) >= min_stops for c in clusters)
+    if add_warnings:
+        if not all_within_min:
+            warnings.append("Could not satisfy minimum stops for every route because "
+                            "of the total number of stops.")
+        if not all_within_max:
+            warnings.append("Some routes exceed the maximum stops per route.")
+    return {
+        "useMinMaxStops": True,
+        "minStopsPerRoute": min_stops,
+        "maxStopsPerRoute": max_stops,
+        "allClustersWithinMax": all_within_max,
+        "allClustersWithinMin": all_within_min,
+    }
+
+
 def optimize_clustered_routes(start_point, start_address, stop_objs,
                               clustering, return_to_start):
     """
@@ -1007,7 +1162,22 @@ def optimize_clustered_routes(start_point, start_address, stop_objs,
     cluster_mode = mode
     recommended = max(2, min(int(clustering.get("recommendedStopsPerRoute") or 5), 25))
 
-    if mode == "stops_per_route":
+    use_minmax = bool(clustering.get("useMinMaxStops"))
+    cluster_size_summary = None
+
+    if use_minmax and mode != "manual":
+        # Min/max overrides per-mode sizing: order stops by a nearest-neighbor tour
+        # and cut into balanced groups in [min, max]. This splits totals cleanly,
+        # e.g. 23 stops -> 6, 6, 6, 5, while keeping each group geographically
+        # contiguous. apply_cluster_size_constraints is a safety pass.
+        min_stops = int(clustering.get("minStopsPerRoute") or 1)
+        max_stops_mm = int(clustering.get("maxStopsPerRoute") or MAX_CLUSTER_SIZE)
+        validate_cluster_size_constraints(len(stop_objs), min_stops, max_stops_mm)
+        sensitivity = clustering.get("distanceSensitivity", "balanced")
+        clusters = balanced_size_clusters(stop_objs, min_stops, max_stops_mm)
+        clusters = apply_cluster_size_constraints(clusters, min_stops, max_stops_mm, sensitivity)
+        cluster_size_summary = _cluster_size_summary(clusters, min_stops, max_stops_mm, warnings)
+    elif mode == "stops_per_route":
         per_route = clustering.get("stopsPerRoute") or 5
         if int(per_route) > MAX_CLUSTER_SIZE:
             warnings.append(f"Stops per route capped at {MAX_CLUSTER_SIZE} "
@@ -1032,6 +1202,21 @@ def optimize_clustered_routes(start_point, start_address, stop_objs,
         clusters = _build_manual_clusters(stop_objs, clustering.get("manualClusters"))
     else:
         raise RouteError("Unknown clustering mode.")
+
+    # Manual + min/max: keep the groups, only warn if any falls outside the range.
+    if use_minmax and mode == "manual":
+        min_stops = int(clustering.get("minStopsPerRoute") or 1)
+        max_stops_mm = int(clustering.get("maxStopsPerRoute") or MAX_CLUSTER_SIZE)
+        validate_cluster_size_constraints(len(stop_objs), min_stops, max_stops_mm)
+        for idx, c in enumerate(clusters, start=1):
+            if len(c) > max_stops_mm:
+                warnings.append(f"Route {idx} has {len(c)} stops, above the maximum "
+                                f"of {max_stops_mm}.")
+            elif len(c) < min_stops:
+                warnings.append(f"Route {idx} has {len(c)} stops, below the minimum "
+                                f"of {min_stops}.")
+        cluster_size_summary = _cluster_size_summary(clusters, min_stops, max_stops_mm, warnings,
+                                                     add_warnings=False)
 
     clusters, split_happened = _enforce_cluster_limit(clusters)
     if split_happened:
@@ -1080,6 +1265,8 @@ def optimize_clustered_routes(start_point, start_address, stop_objs,
     if auto_summary is not None:
         auto_summary["actualRouteCount"] = len(cluster_results)
         result["autoClusterSummary"] = auto_summary
+    if cluster_size_summary is not None:
+        result["clusterSizeSummary"] = cluster_size_summary
     return result
 
 

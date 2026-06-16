@@ -24,6 +24,16 @@
     <button id="alertClose" class="alert-close" aria-label="Dismiss">&times;</button>
   </div>
 
+  <!-- Saved-session banner (shown on load if a local session exists) -->
+  <div id="sessionBanner" class="session-banner hidden">
+    <span>A saved local session was found.</span>
+    <div class="banner-actions">
+      <button id="bannerRestore" class="btn btn-primary">Restore</button>
+      <button id="bannerIgnore" class="btn btn-ghost">Ignore</button>
+      <button id="bannerDelete" class="btn btn-ghost">Delete saved session</button>
+    </div>
+  </div>
+
   <main class="layout">
     <!-- LEFT: controls -->
     <section class="panel">
@@ -120,10 +130,45 @@
           </label>
         </div>
 
+        <div class="minmax-block">
+          <label class="check">
+            <input type="checkbox" id="useMinMax" /><span>Use min/max stops per route</span>
+          </label>
+          <div id="minMaxFields" class="minmax-fields">
+            <label class="sub-field">Minimum stops per route
+              <input id="minStops" type="number" class="text-input small" min="1" max="25" value="5" />
+            </label>
+            <label class="sub-field">Maximum stops per route
+              <input id="maxStops" type="number" class="text-input small" min="1" max="25" value="6" />
+            </label>
+            <span class="hint">Groups will contain between min and max stops when possible
+              (never above 25). May warn when totals make it impossible.</span>
+          </div>
+        </div>
+
         <label class="check disabled-check">
           <input type="checkbox" id="sameStart" checked disabled />
           <span>Each route starts from the same starting address</span>
         </label>
+      </fieldset>
+
+      <!-- Save & share (localStorage + file export/import; no database) -->
+      <fieldset class="mode save-share">
+        <legend>Save &amp; share</legend>
+        <div class="button-row">
+          <button id="exportBtn" class="btn">Export Route File</button>
+          <label class="btn file-label" for="importInput">Import Route File</label>
+          <input id="importInput" type="file" accept="application/json,.json" hidden />
+        </div>
+        <div class="save-local-row">
+          <input id="saveName" type="text" class="text-input" placeholder="Route name" />
+          <button id="saveLocalBtn" class="btn">Save route locally</button>
+        </div>
+        <div class="button-row">
+          <button id="restoreLastBtn" class="btn btn-ghost">Restore last session</button>
+          <button id="clearSessionBtn" class="btn btn-ghost">Clear saved session</button>
+        </div>
+        <div id="savedRoutes" class="saved-routes"></div>
       </fieldset>
 
       <div class="textarea-head">

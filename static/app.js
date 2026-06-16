@@ -30,6 +30,7 @@ const state = {
   trackingActive: false, // true once an optimized result is being tracked
   hideVisited: false,    // collapse visited rows from the list
   hideVisitedMarkers: false, // hide visited markers from the map
+  clusterSizeSummary: null,  // {useMinMaxStops, min, max, allWithinMin/Max} from backend
 };
 
 let nextId = 1;
@@ -92,7 +93,29 @@ const el = {
   hideVisitedMarkers: document.getElementById("hideVisitedMarkers"),
   clearRouteProgressBtn: document.getElementById("clearRouteProgressBtn"),
   clearAllProgressBtn: document.getElementById("clearAllProgressBtn"),
+  // Min/max stops per route
+  useMinMax: document.getElementById("useMinMax"),
+  minMaxFields: document.getElementById("minMaxFields"),
+  minStops: document.getElementById("minStops"),
+  maxStops: document.getElementById("maxStops"),
+  // Save & share / sessions
+  sessionBanner: document.getElementById("sessionBanner"),
+  bannerRestore: document.getElementById("bannerRestore"),
+  bannerIgnore: document.getElementById("bannerIgnore"),
+  bannerDelete: document.getElementById("bannerDelete"),
+  exportBtn: document.getElementById("exportBtn"),
+  importInput: document.getElementById("importInput"),
+  saveName: document.getElementById("saveName"),
+  saveLocalBtn: document.getElementById("saveLocalBtn"),
+  restoreLastBtn: document.getElementById("restoreLastBtn"),
+  clearSessionBtn: document.getElementById("clearSessionBtn"),
+  savedRoutes: document.getElementById("savedRoutes"),
 };
+
+// localStorage keys + schema version.
+const LAST_SESSION_KEY = "routeOptimizerLite:lastSession";
+const SAVED_ROUTES_KEY = "routeOptimizerLite:savedRoutes";
+const SCHEMA_VERSION = 1;
 
 // Distinct colors for route-group polylines / markers.
 const CLUSTER_COLORS = [
@@ -106,10 +129,16 @@ const CLUSTER_COLORS = [
 
 function showError(message) {
   el.alertText.textContent = message;
+  el.alert.classList.remove("hidden", "info");
+}
+function showInfo(message) {
+  el.alertText.textContent = message;
   el.alert.classList.remove("hidden");
+  el.alert.classList.add("info");
 }
 function hideError() {
   el.alert.classList.add("hidden");
+  el.alert.classList.remove("info");
 }
 function showLoading(text) {
   el.loadingText.textContent = text;
@@ -184,38 +213,81 @@ function getCityRestriction() {
   };
 }
 
+function clampInt(value, lo, hi, dflt) {
+  const n = parseInt(value, 10);
+  return Math.max(lo, Math.min(hi, isNaN(n) ? dflt : n));
+}
+
+/** Build a Waze deep link from coordinates. Never trusts a URL from a file
+ *  (prevents javascript:/data: injection via imported route files). */
+function safeWazeUrl(stop) {
+  const lat = Number(stop && stop.lat);
+  const lng = Number(stop && stop.lng);
+  if (isFinite(lat) && isFinite(lng)) {
+    return "https://waze.com/ul?ll=" + lat + "," + lng + "&navigate=yes";
+  }
+  return "#";
+}
+
+/** Read the min/max stops-per-route controls. */
+function readMinMax() {
+  return {
+    useMinMaxStops: el.useMinMax.checked,
+    minStopsPerRoute: clampInt(el.minStops.value, 1, 25, 5),
+    maxStopsPerRoute: clampInt(el.maxStops.value, 1, 25, 6),
+  };
+}
+
+/** Attach min/max fields to a clustering config (overriding max only when on). */
+function withMinMax(cfg) {
+  const mm = readMinMax();
+  cfg.useMinMaxStops = mm.useMinMaxStops;
+  cfg.minStopsPerRoute = mm.minStopsPerRoute;
+  if (mm.useMinMaxStops) cfg.maxStopsPerRoute = mm.maxStopsPerRoute;
+  return cfg;
+}
+
 function getClusteringConfig() {
   const checked = document.querySelector('input[name="cluster"]:checked');
   const mode = checked ? checked.value : "none";
   if (mode === "spr") {
-    return {
+    return withMinMax({
       enabled: true,
       mode: "stops_per_route",
-      stopsPerRoute: Math.max(1, parseInt(el.stopsPerRoute.value, 10) || 5),
+      stopsPerRoute: clampInt(el.stopsPerRoute.value, 1, 25, 5),
       numberOfRoutes: null,
-    };
+    });
   }
   if (mode === "nor") {
-    return {
+    return withMinMax({
       enabled: true,
       mode: "number_of_routes",
       stopsPerRoute: null,
       numberOfRoutes: Math.max(1, parseInt(el.numberOfRoutes.value, 10) || 1),
-    };
+    });
   }
   if (mode === "auto") {
-    const clamp = (v, lo, hi, dflt) =>
-      Math.max(lo, Math.min(hi, parseInt(v, 10) || dflt));
-    return {
+    return withMinMax({
       enabled: true,
       mode: "auto_distance",
-      recommendedStopsPerRoute: clamp(el.autoRecommended.value, 2, 25, 5),
+      recommendedStopsPerRoute: clampInt(el.autoRecommended.value, 2, 25, 5),
       distanceSensitivity: el.distanceSensitivity.value || "balanced",
       autoCombineSmallRoutes: el.autoCombine.checked,
-      maxStopsPerRoute: clamp(el.autoMaxStops.value, 2, 25, 25),
-    };
+      maxStopsPerRoute: clampInt(el.autoMaxStops.value, 2, 25, 25),
+    });
   }
-  return { enabled: false, mode: "none", stopsPerRoute: null, numberOfRoutes: null };
+  return withMinMax({ enabled: false, mode: "none", stopsPerRoute: null, numberOfRoutes: null });
+}
+
+/** Validate min/max before optimizing; returns an error string or null. */
+function validateMinMaxUI() {
+  if (!el.useMinMax.checked) return null;
+  const min = clampInt(el.minStops.value, 1, 25, 5);
+  const max = clampInt(el.maxStops.value, 1, 25, 6);
+  if (min < 1) return "Minimum stops per route must be at least 1.";
+  if (max > 25) return "Maximum stops per route cannot exceed 25.";
+  if (min > max) return "Minimum stops per route cannot be greater than the maximum.";
+  return null;
 }
 
 /* ---------------------------------------------------------------------------
@@ -266,6 +338,7 @@ function loadStops() {
   resetGroups();
   markNeedsValidation();
   setStatus("Not validated", "gray");
+  scheduleSave();
 }
 
 /* ---------------------------------------------------------------------------
@@ -379,6 +452,7 @@ function startEdit(id) {
     resetGroups();
     markNeedsValidation();
     renderStops();
+    scheduleSave();
   };
 
   input.addEventListener("blur", commit);
@@ -394,6 +468,7 @@ function deleteStop(id) {
   updateCounter();
   resetGroups();
   markNeedsValidation();
+  scheduleSave();
 }
 
 /* ---------------------------------------------------------------------------
@@ -477,6 +552,7 @@ async function validateAddresses() {
       setStatus("Validated", "green");
     }
     refreshOptimizeButton();
+    scheduleSave();
   } catch (err) {
     showError("Network error during validation: " + err.message);
   } finally {
@@ -521,17 +597,23 @@ async function optimizeRoute() {
     return;
   }
 
+  const minMaxError = validateMinMaxUI();
+  if (minMaxError) {
+    showError(minMaxError);
+    return;
+  }
+
   const returnToStart = getMode() === "return";
   const cityRestriction = getCityRestriction();
 
   // After a manual combine/separate, re-optimize the edited groups as "manual".
   let clustering;
   if (state.manualMode && state.groups) {
-    clustering = {
+    clustering = withMinMax({
       enabled: true,
       mode: "manual",
       manualClusters: state.groups.map((g) => g.stops.map((s) => s.originalIndex)),
-    };
+    });
   } else {
     clustering = getClusteringConfig();
   }
@@ -560,6 +642,7 @@ async function optimizeRoute() {
     }
 
     state.lastResult = data;
+    state.clusterSizeSummary = data.clusterSizeSummary || null;
     if (data.mode === "clustered") {
       // Build the editable group state from the fresh result.
       state.groups = data.clusters.map((c) => ({
@@ -587,6 +670,7 @@ async function optimizeRoute() {
       renderVisitedProgress();
       el.results.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
+    scheduleSave();
   } catch (err) {
     showError("Network error during optimization: " + err.message);
   } finally {
@@ -671,6 +755,15 @@ function renderGroups() {
       stat("Status", "Pending re-optimize");
   }
 
+  // Min/max stops-per-route summary.
+  const css = state.clusterSizeSummary;
+  if (css && css.useMinMaxStops && allOptimized) {
+    const ok = css.allClustersWithinMin && css.allClustersWithinMax;
+    el.grandSummary.innerHTML +=
+      stat("Stops/route", css.minStopsPerRoute + "–" + css.maxStopsPerRoute +
+        (ok ? " ✓" : " ⚠"));
+  }
+
   el.groupCards.innerHTML = "";
   state.groups.forEach((group, gi) => {
     const ci = gi + 1;
@@ -701,7 +794,25 @@ function renderGroups() {
         ((group.distanceMeters || 0) / 1000).toFixed(1) + " km · " +
         formatDuration(group.durationSeconds || 0)
       : group.stops.length + " stops · pending re-optimize";
-    head.append(left, meta);
+    // Min/max size badge when a group falls outside the requested range.
+    if (group.optimized && css && css.useMinMaxStops) {
+      const n = group.stops.length;
+      if (n > css.maxStopsPerRoute) {
+        const b = document.createElement("span");
+        b.className = "badge badge-red";
+        b.textContent = "Above max (" + n + ")";
+        head.append(left, meta, b);
+      } else if (n < css.minStopsPerRoute) {
+        const b = document.createElement("span");
+        b.className = "badge badge-orange";
+        b.textContent = "Below min (" + n + ")";
+        head.append(left, meta, b);
+      } else {
+        head.append(left, meta);
+      }
+    } else {
+      head.append(left, meta);
+    }
 
     card.append(head);
 
@@ -768,6 +879,7 @@ function afterManualEdit() {
   el.tracker.classList.add("hidden");
   renderGroups();
   drawGroups();
+  scheduleSave();
 }
 
 function combineSelectedRoutes() {
@@ -886,7 +998,7 @@ function orderedItem(stop, label, color, stopKey) {
 
   const waze = document.createElement("a");
   waze.className = "waze-btn";
-  waze.href = stop.wazeUrl || "#";
+  waze.href = safeWazeUrl(stop);
   waze.target = "_blank";
   waze.rel = "noopener";
   waze.textContent = "Open in Waze";
@@ -998,6 +1110,7 @@ function clearAll() {
   state.visited = {};
   state.routeSignature = null;
   state.trackingActive = false;
+  state.clusterSizeSummary = null;
 
   el.start.value = "";
   el.stopsInput.value = "";
@@ -1071,8 +1184,18 @@ function initMap() {
     fullscreenControl: false,
     styles: DARK_MAP_STYLE,
   });
+  redrawCurrentRoute(); // restore markers/polylines if a session was loaded first
 }
 window.initMap = initMap; // Google calls this by name.
+
+/** Redraw the current route (single or clustered) without recomputing. */
+function redrawCurrentRoute() {
+  if (!map) return;
+  if (state.groups) drawGroups();
+  else if (state.lastResult && Array.isArray(state.lastResult.orderedStops)) {
+    drawRoute(state.lastResult);
+  }
+}
 
 function clearMap() {
   mapMarkers.forEach((m) => m.setMap(null));
@@ -1409,6 +1532,7 @@ function afterVisitedChange() {
   else if (state.lastResult) renderResults(state.lastResult);
   updateAllMarkers();
   renderVisitedProgress();
+  scheduleSave();
 }
 
 function markStopVisited(stopKey) {
@@ -1569,7 +1693,7 @@ function renderVisitedProgress() {
   acts.className = "next-actions";
   const waze = document.createElement("a");
   waze.className = "waze-btn";
-  waze.href = next.stop.wazeUrl || "#";
+  waze.href = safeWazeUrl(next.stop);
   waze.target = "_blank";
   waze.rel = "noopener";
   waze.textContent = "Open in Waze";
@@ -1580,6 +1704,435 @@ function renderVisitedProgress() {
   acts.append(waze, mark);
 
   el.nextStop.append(label, addr, meta, acts);
+}
+
+/* ---------------------------------------------------------------------------
+ * Save / restore / export / import (no database; localStorage + JSON files)
+ *
+ * One serializable shape is used for autosave, named saves, and export files,
+ * so restore/import share a single code path. Imported data is treated as data
+ * only (validated, rendered via textContent, Waze links rebuilt from coords).
+ * ------------------------------------------------------------------------- */
+
+function numOrNull(v) {
+  const n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+function setRadioByName(name, value) {
+  const radio = document.querySelector(
+    'input[name="' + name + '"][value="' + value + '"]');
+  if (radio) radio.checked = true;
+}
+
+function clusterModeToRadio(clustering) {
+  const map = { stops_per_route: "spr", number_of_routes: "nor",
+                auto_distance: "auto" };
+  if (!clustering || !clustering.enabled) return "none";
+  return map[clustering.mode] || "none";
+}
+
+/** Capture all clustering UI controls (for faithful restore). */
+function clusteringForSave() {
+  const cfg = getClusteringConfig();
+  cfg.radioMode = (document.querySelector('input[name="cluster"]:checked') || {}).value || "none";
+  cfg.stopsPerRoute = clampInt(el.stopsPerRoute.value, 1, 25, 5);
+  cfg.numberOfRoutes = Math.max(1, parseInt(el.numberOfRoutes.value, 10) || 1);
+  cfg.recommendedStopsPerRoute = clampInt(el.autoRecommended.value, 2, 25, 5);
+  cfg.distanceSensitivity = el.distanceSensitivity.value || "balanced";
+  cfg.autoCombineSmallRoutes = el.autoCombine.checked;
+  cfg.autoMaxStopsPerRoute = clampInt(el.autoMaxStops.value, 2, 25, 25);
+  const mm = readMinMax();
+  cfg.useMinMaxStops = mm.useMinMaxStops;
+  cfg.minStopsPerRoute = mm.minStopsPerRoute;
+  cfg.maxStopsPerRoute = mm.useMinMaxStops ? mm.maxStopsPerRoute : cfg.autoMaxStopsPerRoute;
+  return cfg;
+}
+
+/** Build the portable session/export object from current state. */
+function buildSessionObject() {
+  const cr = getCityRestriction();
+  const stops = state.stops.map((s, i) => ({
+    originalIndex: i,
+    input: s.address,
+    formattedAddress: s.formattedAddress,
+    lat: s.lat,
+    lng: s.lng,
+    validationStatus: s.status,
+    matchedCity: s.matchedCity,
+    requestedCity: cr.enabled ? cr.city : null,
+  }));
+  return {
+    appName: "Route Optimizer Lite",
+    schemaVersion: SCHEMA_VERSION,
+    exportedAt: new Date().toISOString(),
+    startAddress: el.start.value.trim(),
+    stops: stops,
+    routeSettings: { returnToStart: getMode() === "return",
+                     endAnywhere: getMode() !== "return" },
+    cityRestriction: cr,
+    clustering: clusteringForSave(),
+    optimizationResult: state.lastResult || null,
+    visitedState: { visited: state.visited || {} },
+    uiState: { hideVisitedStops: state.hideVisited,
+               hideVisitedMarkers: state.hideVisitedMarkers },
+    // Extra (non-schema) client fields for exact local restore. Importers that
+    // don't have these reconstruct from optimizationResult instead.
+    clientState: {
+      groups: state.groups,
+      validated: state.validated,
+      needsValidation: state.needsValidation,
+      manualMode: state.manualMode,
+      optimizeStale: state.optimizeStale,
+      trackingActive: state.trackingActive,
+      routeSignature: state.routeSignature,
+      clusterSizeSummary: state.clusterSizeSummary,
+    },
+  };
+}
+
+function hasMeaningfulState() {
+  return el.start.value.trim() !== "" || state.stops.length > 0 || !!state.lastResult;
+}
+
+let _saveTimer = null;
+function scheduleSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveSession, 400);
+}
+function saveSession() {
+  if (!hasMeaningfulState()) return;
+  try {
+    localStorage.setItem(LAST_SESSION_KEY, JSON.stringify(buildSessionObject()));
+  } catch (e) { /* storage disabled/full */ }
+}
+
+function validateImportedObject(obj) {
+  if (!obj || typeof obj !== "object") return "Invalid route file.";
+  if (obj.appName !== "Route Optimizer Lite") return "Invalid route file.";
+  if (typeof obj.schemaVersion !== "number" || obj.schemaVersion > SCHEMA_VERSION) {
+    return "Unsupported route file version.";
+  }
+  if (!Array.isArray(obj.stops)) return "Invalid route file.";
+  return null;
+}
+
+/** Set up the visited tracker from imported visited data (not localStorage). */
+function setupTrackingFromImported(visited) {
+  buildTrackGroups();
+  if (!state.trackGroups) {
+    state.trackingActive = false;
+    return;
+  }
+  state.routeSignature = generateRouteSignature();
+  state.visited = visited || {};
+  state.trackingActive = true;
+  saveVisitedState(); // persist imported progress under this route signature
+}
+
+/** Restore the whole app from a session/export object. No Google calls. */
+function applySessionObject(obj, successMessage) {
+  const err = validateImportedObject(obj);
+  if (err) { showError(err); return false; }
+  hideError();
+
+  // Form: start + route mode.
+  el.start.value = obj.startAddress || "";
+  state.startAddress = (obj.startAddress || "").trim();
+  const rs = obj.routeSettings || {};
+  setRadioByName("mode", rs.returnToStart === false ? "anywhere" : "return");
+
+  // City restriction.
+  const cr = obj.cityRestriction || {};
+  el.cityEnabled.checked = !!cr.enabled;
+  el.cityName.value = cr.city || "";
+  el.cityCountry.value = cr.country || "IL";
+  el.cityStrict.checked = cr.strict !== false;
+  syncCityDisabled();
+
+  // Clustering settings (with safe defaults for older files).
+  const cl = obj.clustering || {};
+  setRadioByName("cluster", cl.radioMode || clusterModeToRadio(cl));
+  if (cl.stopsPerRoute) el.stopsPerRoute.value = cl.stopsPerRoute;
+  if (cl.numberOfRoutes) el.numberOfRoutes.value = cl.numberOfRoutes;
+  if (cl.recommendedStopsPerRoute) el.autoRecommended.value = cl.recommendedStopsPerRoute;
+  if (cl.distanceSensitivity) el.distanceSensitivity.value = cl.distanceSensitivity;
+  el.autoCombine.checked = cl.autoCombineSmallRoutes !== false;
+  if (cl.autoMaxStopsPerRoute) el.autoMaxStops.value = cl.autoMaxStopsPerRoute;
+  else if (cl.maxStopsPerRoute && !cl.useMinMaxStops) el.autoMaxStops.value = cl.maxStopsPerRoute;
+  el.useMinMax.checked = !!cl.useMinMaxStops;
+  if (cl.minStopsPerRoute) el.minStops.value = cl.minStopsPerRoute;
+  if (cl.maxStopsPerRoute) el.maxStops.value = cl.maxStopsPerRoute;
+  onClusterModeChange();
+  toggleMinMaxFields();
+
+  // Stops (rebuilt with fresh ids; rendered via textContent in renderStops).
+  state.stops = (obj.stops || []).map((st) => ({
+    id: nextId++,
+    address: String(st.input || ""),
+    status: typeof st.validationStatus === "string" ? st.validationStatus : "not_validated",
+    formattedAddress: st.formattedAddress != null ? String(st.formattedAddress) : null,
+    lat: numOrNull(st.lat),
+    lng: numOrNull(st.lng),
+    matchedCity: st.matchedCity != null ? String(st.matchedCity) : null,
+    message: null,
+  }));
+  renderStops();
+  updateCounter();
+
+  // UI flags + visited + result.
+  state.hideVisited = !!(obj.uiState && obj.uiState.hideVisitedStops);
+  state.hideVisitedMarkers = !!(obj.uiState && obj.uiState.hideVisitedMarkers);
+  el.hideVisited.checked = state.hideVisited;
+  el.hideVisitedMarkers.checked = state.hideVisitedMarkers;
+  const importedVisited = (obj.visitedState && obj.visitedState.visited &&
+    typeof obj.visitedState.visited === "object") ? obj.visitedState.visited : {};
+  const csState = obj.clientState || {};
+  state.lastResult = obj.optimizationResult || null;
+  state.clusterSizeSummary = (state.lastResult && state.lastResult.clusterSizeSummary) ||
+    csState.clusterSizeSummary || null;
+
+  if (state.lastResult) {
+    if (state.lastResult.mode === "clustered" && Array.isArray(state.lastResult.clusters)) {
+      if (Array.isArray(csState.groups) && csState.groups.length) {
+        state.groups = csState.groups; // exact (preserves any pending manual edit)
+      } else {
+        state.groups = state.lastResult.clusters.map((c) => ({
+          stops: Array.isArray(c.orderedStops) ? c.orderedStops : [],
+          optimized: true,
+          distanceMeters: c.totalDistanceMeters || 0,
+          durationSeconds: c.totalDurationSeconds || 0,
+          encodedPolylines: Array.isArray(c.encodedPolylines) ? c.encodedPolylines : [],
+          reason: c.clusterReason || null,
+          avgKm: (typeof c.averageDistanceFromClusterCenterKm === "number")
+            ? c.averageDistanceFromClusterCenterKm : null,
+        }));
+      }
+    } else {
+      state.groups = null;
+    }
+    setupTrackingFromImported(importedVisited);
+    state.optimizeStale = !!csState.optimizeStale;
+    state.manualMode = !!csState.manualMode;
+    state.validated = csState.validated != null ? !!csState.validated : true;
+    state.needsValidation = csState.needsValidation != null ? !!csState.needsValidation : false;
+    if (state.groups) renderGroups();
+    else renderResults(state.lastResult);
+    redrawCurrentRoute();
+    renderVisitedProgress();
+  } else {
+    state.groups = null;
+    state.trackingActive = false;
+    state.visited = {};
+    el.tracker.classList.add("hidden");
+    el.results.classList.add("hidden");
+    el.routeGroups.classList.add("hidden");
+    clearMap();
+    const inferred = state.stops.length > 0 && state.stops.every((s) =>
+      s.status && s.status !== "not_validated" && s.status !== "not_found");
+    state.validated = csState.validated != null ? !!csState.validated : inferred;
+    state.needsValidation = csState.needsValidation != null
+      ? !!csState.needsValidation : !state.validated;
+  }
+
+  if (state.validated && !state.needsValidation) setStatus("Validated", "green");
+  else if (state.needsValidation && state.stops.length) setStatus("Needs validation", "yellow");
+  else setStatus("Not validated", "gray");
+  refreshOptimizeButton();
+
+  saveSession();
+  if (successMessage) showInfo(successMessage);
+  return true;
+}
+
+/* ----- Export / import files ----- */
+
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function dateStamp() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function exportRouteFile() {
+  if (!hasMeaningfulState()) {
+    showError("Nothing to export yet. Add stops first.");
+    return;
+  }
+  downloadJSON(buildSessionObject(), "route-optimizer-lite-" + dateStamp() + ".json");
+  showInfo("Route file exported successfully.");
+}
+
+function importRouteFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    let obj;
+    try {
+      obj = JSON.parse(reader.result);
+    } catch (e) {
+      showError("Invalid route file.");
+      return;
+    }
+    const msg = (obj && obj.optimizationResult)
+      ? "Route file imported and restored."
+      : "Route file imported. Click Optimize Route to calculate the route.";
+    applySessionObject(obj, msg);
+  };
+  reader.onerror = () => showError("Could not read the file.");
+  reader.readAsText(file);
+}
+
+/* ----- Named local saves ----- */
+
+function readSavedRoutes() {
+  try {
+    const raw = localStorage.getItem(SAVED_ROUTES_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function writeSavedRoutes(arr) {
+  try {
+    localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(arr));
+  } catch (e) { /* ignore */ }
+}
+
+function saveRouteLocally() {
+  const name = el.saveName.value.trim();
+  if (!name) { showError("Enter a name for the saved route."); return; }
+  if (!hasMeaningfulState()) { showError("Nothing to save yet."); return; }
+  const entry = {
+    id: "r" + Date.now(),
+    name: name,
+    savedAt: new Date().toISOString(),
+    stopCount: state.stops.length,
+    mode: getMode() === "return" ? "Return to start" : "End anywhere",
+    data: buildSessionObject(),
+  };
+  const arr = readSavedRoutes();
+  arr.unshift(entry);
+  writeSavedRoutes(arr);
+  el.saveName.value = "";
+  renderSavedRoutes();
+  showInfo("Route saved locally.");
+}
+
+function renderSavedRoutes() {
+  const arr = readSavedRoutes();
+  el.savedRoutes.innerHTML = "";
+  if (!arr.length) return;
+  const title = document.createElement("div");
+  title.className = "saved-title";
+  title.textContent = "Saved Routes";
+  el.savedRoutes.append(title);
+
+  arr.forEach((entry) => {
+    const row = document.createElement("div");
+    row.className = "saved-row";
+
+    const info = document.createElement("div");
+    info.className = "saved-info";
+    const nm = document.createElement("div");
+    nm.className = "saved-name";
+    nm.textContent = entry.name;
+    const meta = document.createElement("div");
+    meta.className = "saved-meta";
+    meta.textContent = entry.stopCount + " stops · " + entry.mode + " · " +
+      formatSavedDate(entry.savedAt);
+    info.append(nm, meta);
+
+    const acts = document.createElement("div");
+    acts.className = "saved-actions";
+    const load = makeMiniBtn("Load", () => loadSavedRoute(entry.id));
+    const exp = makeMiniBtn("Export", () => exportSavedRoute(entry.id));
+    const del = makeMiniBtn("Delete", () => deleteSavedRoute(entry.id));
+    del.classList.add("danger");
+    acts.append(load, exp, del);
+
+    row.append(info, acts);
+    el.savedRoutes.append(row);
+  });
+}
+
+function makeMiniBtn(text, fn) {
+  const b = document.createElement("button");
+  b.className = "icon-btn";
+  b.textContent = text;
+  b.onclick = fn;
+  return b;
+}
+
+function formatSavedDate(iso) {
+  try {
+    return new Date(iso).toLocaleString();
+  } catch (e) {
+    return "";
+  }
+}
+
+function loadSavedRoute(id) {
+  const entry = readSavedRoutes().find((x) => x.id === id);
+  if (entry) applySessionObject(entry.data, "Saved route loaded.");
+}
+
+function deleteSavedRoute(id) {
+  writeSavedRoutes(readSavedRoutes().filter((x) => x.id !== id));
+  renderSavedRoutes();
+}
+
+function exportSavedRoute(id) {
+  const entry = readSavedRoutes().find((x) => x.id === id);
+  if (entry) {
+    downloadJSON(entry.data, "route-optimizer-lite-" + dateStamp() + ".json");
+    showInfo("Route file exported successfully.");
+  }
+}
+
+/* ----- Last-session banner / restore / clear ----- */
+
+function checkSavedSessionBanner() {
+  try {
+    if (localStorage.getItem(LAST_SESSION_KEY)) {
+      el.sessionBanner.classList.remove("hidden");
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function restoreLastSession() {
+  let raw;
+  try {
+    raw = localStorage.getItem(LAST_SESSION_KEY);
+  } catch (e) { raw = null; }
+  if (!raw) { showError("No saved session found."); return; }
+  let obj;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e) {
+    showError("Saved session is corrupted.");
+    return;
+  }
+  el.sessionBanner.classList.add("hidden");
+  applySessionObject(obj, "Last session restored.");
+}
+
+function clearSavedSession() {
+  try {
+    localStorage.removeItem(LAST_SESSION_KEY);
+  } catch (e) { /* ignore */ }
+  el.sessionBanner.classList.add("hidden");
+  showInfo("Saved session cleared.");
 }
 
 /* ---------------------------------------------------------------------------
@@ -1606,15 +2159,25 @@ function onClusterModeChange() {
   state.manualMode = false;
 }
 
-function onCityToggle() {
-  // Visually enable/disable the city inputs.
+function syncCityDisabled() {
   const on = el.cityEnabled.checked;
   el.cityFields.classList.toggle("disabled", !on);
   el.cityName.disabled = !on;
   el.cityCountry.disabled = !on;
   el.cityStrict.disabled = !on;
+}
+
+function onCityToggle() {
+  syncCityDisabled();
   // Changing city restriction requires re-validation.
   if (!state.needsValidation) markNeedsValidation();
+}
+
+function toggleMinMaxFields() {
+  const on = el.useMinMax.checked;
+  el.minMaxFields.classList.toggle("disabled", !on);
+  el.minStops.disabled = !on;
+  el.maxStops.disabled = !on;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1668,10 +2231,40 @@ document.querySelectorAll('input[name="cluster"]').forEach((node) =>
   node.addEventListener("change", onClusterModeChange)
 );
 
+// Min/max stops per route.
+el.useMinMax.addEventListener("change", () => { toggleMinMaxFields(); scheduleSave(); });
+[el.minStops, el.maxStops].forEach((n) => n.addEventListener("input", scheduleSave));
+
+// Save & share / sessions.
+el.exportBtn.addEventListener("click", exportRouteFile);
+el.importInput.addEventListener("change", (e) => {
+  const file = e.target.files && e.target.files[0];
+  if (file) importRouteFile(file);
+  e.target.value = ""; // allow re-importing the same file
+});
+el.saveLocalBtn.addEventListener("click", saveRouteLocally);
+el.restoreLastBtn.addEventListener("click", restoreLastSession);
+el.clearSessionBtn.addEventListener("click", clearSavedSession);
+el.bannerRestore.addEventListener("click", restoreLastSession);
+el.bannerIgnore.addEventListener("click", () => el.sessionBanner.classList.add("hidden"));
+el.bannerDelete.addEventListener("click", clearSavedSession);
+
+// Autosave on any meaningful control change (debounced).
+[el.start, el.cityName, el.cityCountry, el.stopsPerRoute, el.numberOfRoutes,
+ el.autoRecommended, el.distanceSensitivity, el.autoMaxStops].forEach((n) =>
+  n && n.addEventListener("input", scheduleSave));
+[el.cityEnabled, el.cityStrict, el.autoCombine].forEach((n) =>
+  n && n.addEventListener("change", scheduleSave));
+document.querySelectorAll('input[name="mode"], input[name="cluster"]').forEach((n) =>
+  n.addEventListener("change", scheduleSave));
+
 // Initialize UI state.
 onClusterModeChange();
 onCityToggle();
+toggleMinMaxFields();
 updateCounter();
+renderSavedRoutes();
+checkSavedSessionBanner();
 
 // Load the map on startup.
 loadGoogleMaps();
