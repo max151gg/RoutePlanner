@@ -36,11 +36,18 @@ except ImportError:  # pragma: no cover - optional dependency
 # Load GOOGLE_MAPS_API_KEY from the .env file (if present).
 load_dotenv()
 API_KEY = (os.environ.get("GOOGLE_MAPS_API_KEY") or "").strip()
+# Server-side key for Places API calls. Prefer a dedicated server key; fall back
+# to the general key for local-dev compatibility. Never sent to the browser.
+SERVER_KEY = (os.environ.get("GOOGLE_MAPS_SERVER_KEY")
+              or os.environ.get("GOOGLE_MAPS_API_KEY") or "").strip()
 
 # --- Constants ---------------------------------------------------------------
 
 GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+PLACES_AUTOCOMPLETE_URL = "https://places.googleapis.com/v1/places:autocomplete"
+PLACES_DETAILS_URL = "https://places.googleapis.com/v1/places/"  # + place id
+PLACE_DETAILS_FIELD_MASK = "id,formattedAddress,location,addressComponents,types,displayName"
 
 MAX_STOPS = 50              # Hard cap on stops accepted from the user.
 EXACT_OPT_LIMIT = 25        # Google optimizes up to 25 intermediate waypoints.
@@ -105,6 +112,16 @@ def require_api_key():
             "and add your key.",
             status_code=500,
         )
+
+
+def require_server_key():
+    """Return the server-side key for Places calls, or raise a clean error."""
+    if not SERVER_KEY:
+        raise RouteError(
+            "Server is missing GOOGLE_MAPS_SERVER_KEY (or GOOGLE_MAPS_API_KEY).",
+            status_code=500,
+        )
+    return SERVER_KEY
 
 
 # --- City normalization / aliases -------------------------------------------
@@ -339,14 +356,50 @@ def validate_address(address, city=None, country=None):
     return geocode_address(address, city, country)
 
 
-def validate_addresses(start_address, stops, city_restriction):
+def _result_from_selection(selection, input_text, city_restriction):
+    """
+    Build a validation/geocode-shaped result from a manually selected place,
+    WITHOUT geocoding the original input again. Strict city restriction is still
+    enforced (a hand-picked wrong-city match is still flagged).
+    """
+    matched_city = selection.get("matchedCity")
+    formatted = selection.get("formattedAddress")
+    lat = selection.get("lat")
+    lng = selection.get("lng")
+    requested_city = city_restriction["city"]
+
+    status, message = "found", None
+    if requested_city and not cities_match(requested_city, matched_city, formatted):
+        status = "city_mismatch"
+        message = (f"Selected match is in {matched_city or 'another city'}, "
+                   f"not {requested_city}.")
+
+    result = _geo(status, input_text, formatted, formatted, lat, lng,
+                  requested_city, matched_city, message)
+    result["placeId"] = selection.get("placeId")
+    result["manuallySelected"] = True
+    return result
+
+
+def _has_manual_selection(selection):
+    """True when a selection dict carries a usable manual place choice."""
+    return bool(selection and selection.get("manuallySelected")
+                and selection.get("lat") is not None
+                and selection.get("lng") is not None)
+
+
+def validate_addresses(start_address, stops, city_restriction,
+                       start_selection=None, selections=None):
     """
     Validate the start address and every stop. Honors city restriction.
+    Manually selected rows are trusted (re-checked for city only), never
+    re-geocoded from the original fuzzy input.
     Returns the full payload for /api/validate-addresses.
     """
     city = city_restriction["city"]
     country = city_restriction["country"]
     strict = city_restriction["strict"]
+    selections = selections or []
 
     def to_out(result, index=None):
         out = {
@@ -359,12 +412,19 @@ def validate_addresses(start_address, stops, city_restriction):
             "requestedCity": result["requestedCity"],
             "matchedCity": result["matchedCity"],
             "message": result["message"],
+            "placeId": result.get("placeId"),
+            "manuallySelected": bool(result.get("manuallySelected")),
         }
         if index is not None:
             out = {"index": index, **out}
         return out
 
-    start = validate_address(start_address, city, country)
+    def validate_one(address, selection):
+        if _has_manual_selection(selection):
+            return _result_from_selection(selection, address, city_restriction)
+        return validate_address(address, city, country)
+
+    start = validate_one(start_address, start_selection)
     start_out = to_out(start)
 
     stops_out, warnings = [], []
@@ -381,7 +441,8 @@ def validate_addresses(start_address, stops, city_restriction):
         warnings.append(f"Start is ambiguous: {start['formattedAddress']}")
 
     for index, stop in enumerate(stops):
-        result = validate_address(stop, city, country)
+        selection = selections[index] if index < len(selections) else None
+        result = validate_one(stop, selection)
         stops_out.append(to_out(result, index))
         if result["status"] == "not_found":
             blocked = True
@@ -400,6 +461,246 @@ def validate_addresses(start_address, stops, city_restriction):
         "stops": stops_out,
         "canOptimize": not blocked,
         "warnings": warnings,
+    }
+
+
+# --- Address Candidate Picker (Places API New) -------------------------------
+
+def is_address_like_place(types):
+    """True when the place types look like a precise address/POI (not a region)."""
+    address_like = {
+        "street_address", "premise", "subpremise", "establishment",
+        "point_of_interest", "intersection", "route", "geocode",
+    }
+    return bool(set(types or []) & address_like)
+
+
+def build_city_biased_query(input_text, city_restriction):
+    """Append ', City[, Country]' to the search text when missing (city-aware)."""
+    if not city_restriction.get("enabled"):
+        return input_text
+    city = city_restriction.get("city")
+    country = city_restriction.get("country")
+    query = input_text
+    if city and normalize_city(city) not in normalize_city(input_text):
+        query = f"{input_text}, {city}"
+    if country:
+        country_name = COUNTRY_NAMES.get(country.upper(), country)
+        if normalize_city(country_name) not in normalize_city(query):
+            query = f"{query}, {country_name}"
+    return query
+
+
+def normalize_candidate(suggestion):
+    """Flatten one Places Autocomplete (New) suggestion to our candidate shape."""
+    prediction = suggestion.get("placePrediction", {}) or {}
+    structured = prediction.get("structuredFormat", {}) or {}
+    main = (structured.get("mainText") or {}).get("text") or \
+        (prediction.get("text") or {}).get("text") or ""
+    secondary = (structured.get("secondaryText") or {}).get("text") or ""
+    display = (prediction.get("text") or {}).get("text") or \
+        (main + (", " + secondary if secondary else ""))
+    return {
+        "placeId": prediction.get("placeId"),
+        "mainText": main,
+        "secondaryText": secondary,
+        "displayText": display,
+        "types": prediction.get("types", []),
+        "source": "places_autocomplete",
+    }
+
+
+def rank_candidates(candidates, requested_city, requested_country):
+    """
+    Stable-sort candidates: city match first, then address-like precision, then
+    country match. (Python's sort is stable, so autocomplete relevance is the
+    tie-breaker.)
+    """
+    country_name = COUNTRY_NAMES.get((requested_country or "").upper(),
+                                     requested_country or "")
+    city_names = set()
+    if requested_city:
+        city_names = set(CANONICAL_TO_NAMES.get(canonical_city(requested_city), []))
+        city_names.add(normalize_city(requested_city))
+
+    def score(candidate):
+        text = normalize_city(candidate.get("displayText", ""))
+        value = 0
+        if city_names and any(n and n in text for n in city_names):
+            value += 1000
+        if is_address_like_place(candidate.get("types", [])):
+            value += 100
+        if country_name and normalize_city(country_name) in text:
+            value += 10
+        return value
+
+    return sorted(candidates, key=score, reverse=True)
+
+
+def _geocode_results(query, country=None):
+    """Return the raw Geocoding API results list for a query (or [])."""
+    require_api_key()
+    params = {"address": query, "key": API_KEY}
+    if country:
+        params["components"] = f"country:{country.upper()}"
+    try:
+        resp = requests.get(GEOCODE_URL, params=params, timeout=15)
+        data = resp.json()
+    except (requests.RequestException, ValueError):
+        return []
+    return data.get("results", []) if data.get("status") == "OK" else []
+
+
+def _city_center(city, country):
+    """Resolve a city center {latitude, longitude} for location bias (or None)."""
+    if not city:
+        return None
+    query = city
+    if country:
+        query = f"{city}, {COUNTRY_NAMES.get(country.upper(), country)}"
+    results = _geocode_results(query, country)
+    if results:
+        loc = results[0]["geometry"]["location"]
+        return {"latitude": loc["lat"], "longitude": loc["lng"]}
+    return None
+
+
+def fallback_geocoding_candidates(input_text, city_restriction):
+    """When Places returns nothing, surface Geocoding results as candidates."""
+    country = city_restriction.get("country")
+    queries = []
+    if city_restriction.get("enabled") and city_restriction.get("city"):
+        queries.append(build_city_biased_query(input_text, city_restriction))
+    queries.append(input_text)
+
+    candidates, seen = [], set()
+    for query in queries:
+        for result in _geocode_results(query, country):
+            place_id = result.get("place_id")
+            if not place_id or place_id in seen:
+                continue
+            seen.add(place_id)
+            formatted = result.get("formatted_address") or input_text
+            candidates.append({
+                "placeId": place_id,
+                "mainText": formatted,
+                "secondaryText": "",
+                "displayText": formatted,
+                "types": result.get("types", []),
+                "source": "geocoding",
+            })
+    return rank_candidates(candidates, city_restriction.get("city"), country)[:8]
+
+
+def get_address_candidates(input_text, city_restriction, language_code="he"):
+    """Return (candidates, warnings) for an address using Places Autocomplete."""
+    key = require_server_key()
+    warnings = []
+    enabled = city_restriction.get("enabled")
+    city = city_restriction.get("city")
+    country = city_restriction.get("country")
+    query = build_city_biased_query(input_text, city_restriction) if enabled else input_text
+
+    body = {"input": query, "languageCode": language_code or "he"}
+    if country:
+        body["includedRegionCodes"] = [country.lower()]
+    if enabled and city:
+        center = _city_center(city, country)
+        if center:
+            # Bias (not restrict) so good nearby matches surface first without
+            # hiding alternatives the user might actually want.
+            body["locationBias"] = {"circle": {"center": center, "radius": 30000.0}}
+
+    headers = {"Content-Type": "application/json", "X-Goog-Api-Key": key}
+    try:
+        resp = requests.post(PLACES_AUTOCOMPLETE_URL, headers=headers,
+                             data=json.dumps(body), timeout=15)
+        data = resp.json()
+    except requests.RequestException as exc:
+        raise RouteError(f"Network error contacting Places API: {exc}", 502)
+    except ValueError:
+        raise RouteError("Invalid response from Places API.", 502)
+
+    if resp.status_code != 200:
+        message = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+        warnings.append(f"Places Autocomplete error ({message or resp.status_code}); "
+                        "showing geocoding alternatives.")
+        return fallback_geocoding_candidates(input_text, city_restriction), warnings
+
+    suggestions = data.get("suggestions") or []
+    candidates = [normalize_candidate(s) for s in suggestions if s.get("placePrediction")]
+    candidates = [c for c in candidates if c["placeId"]]
+
+    if not candidates:
+        warnings.append("No Places suggestions found; showing geocoding alternatives.")
+        return fallback_geocoding_candidates(input_text, city_restriction), warnings
+
+    return rank_candidates(candidates, city, country)[:8], warnings
+
+
+def extract_city_from_place_details(address_components):
+    """Pull the best 'city' from Places Details (New) addressComponents."""
+    by_type = {}
+    for comp in address_components or []:
+        name = comp.get("longText") or comp.get("long_name") or comp.get("shortText")
+        for type_name in comp.get("types", []):
+            by_type.setdefault(type_name, name)
+    for type_name in CITY_COMPONENT_TYPES:
+        if by_type.get(type_name):
+            return by_type[type_name]
+    return None
+
+
+def resolve_place_details(place_id, original_input, city_restriction, language_code="he"):
+    """Fetch Place Details (New) for a chosen candidate and apply city matching."""
+    key = require_server_key()
+    url = PLACES_DETAILS_URL + place_id
+    headers = {"X-Goog-Api-Key": key, "X-Goog-FieldMask": PLACE_DETAILS_FIELD_MASK}
+    params = {"languageCode": language_code or "he"}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        data = resp.json()
+    except requests.RequestException as exc:
+        raise RouteError(f"Network error contacting Places API: {exc}", 502)
+    except ValueError:
+        raise RouteError("Invalid response from Places API.", 502)
+
+    if resp.status_code != 200:
+        message = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+        raise RouteError(f"Could not resolve the selected place: {message or resp.status_code}", 502)
+
+    location = data.get("location", {}) or {}
+    lat = location.get("latitude")
+    lng = location.get("longitude")
+    if lat is None or lng is None:
+        raise RouteError("The selected place has no coordinates.", 502)
+
+    formatted = data.get("formattedAddress")
+    types = data.get("types", [])
+    matched_city = extract_city_from_place_details(data.get("addressComponents", []))
+    requested_city = city_restriction.get("city")
+
+    status, message = "found", None
+    if requested_city and not cities_match(requested_city, matched_city, formatted):
+        status = "city_mismatch"
+        message = (f"Selected match is in {matched_city or 'another city'}, "
+                   f"not {requested_city}.")
+    elif not is_address_like_place(types):
+        status = "ambiguous"
+        message = "This match is broad (an area, not a precise address). Check it."
+
+    return {
+        "input": original_input,
+        "placeId": data.get("id") or place_id,
+        "status": status,
+        "formattedAddress": formatted,
+        "lat": lat,
+        "lng": lng,
+        "requestedCity": requested_city,
+        "matchedCity": matched_city,
+        "types": types,
+        "manuallySelected": True,
+        "message": message,
     }
 
 
@@ -1273,12 +1574,28 @@ def optimize_clustered_routes(start_point, start_address, stop_objs,
 # --- Request parsing helpers -------------------------------------------------
 
 def _read_request():
-    """Parse and lightly clean the common request body for both endpoints."""
+    """
+    Parse and lightly clean the common request body for both endpoints.
+    Returns (body, start_address, stops, selections) where `selections` is a
+    list parallel to `stops` (each entry a manual-selection dict or None).
+    """
     body = request.get_json(force=True, silent=True) or {}
     start_address = (body.get("startAddress") or "").strip()
     raw_stops = body.get("stops") or []
-    # Strip, drop empties, then dedupe exact duplicates.
-    stops = dedupe([s.strip() for s in raw_stops if s and s.strip()])
+    raw_selections = body.get("selections") or []
+
+    # Strip, drop empties, then dedupe - keeping each stop's selection aligned.
+    stops, selections, seen = [], [], set()
+    for i, value in enumerate(raw_stops):
+        if not value or not value.strip():
+            continue
+        text = value.strip()
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        stops.append(text)
+        selections.append(raw_selections[i] if i < len(raw_selections) else None)
 
     if not start_address:
         raise RouteError("Start address is required.")
@@ -1286,7 +1603,7 @@ def _read_request():
         raise RouteError("At least one stop is required.")
     if len(stops) > MAX_STOPS:
         raise RouteError("Maximum 50 stops allowed.")
-    return body, start_address, stops
+    return body, start_address, stops, selections
 
 
 def _parse_city_restriction(body):
@@ -1306,17 +1623,42 @@ def _parse_city_restriction(body):
     }
 
 
-def _geocode_all(start_address, stops, city_restriction):
+def _resolve_point(address, selection, city, country):
     """
-    Geocode the start + every stop (honoring city restriction). Returns
-    (start_point, stop_objs). Raises a clean error on hard failures and on
-    strict city mismatches.
+    Resolve one address to coordinates. Manually selected rows use their saved
+    place data (no re-geocoding of the fuzzy input); others are geocoded.
+    """
+    if _has_manual_selection(selection):
+        matched = selection.get("matchedCity")
+        formatted = selection.get("formattedAddress") or address
+        status = "found"
+        if city and not cities_match(city, matched, formatted):
+            status = "city_mismatch"
+        return {
+            "status": status,
+            "lat": selection["lat"],
+            "lng": selection["lng"],
+            "formattedAddress": formatted,
+            "matchedCity": matched,
+            "requestedCity": city,
+            "placeId": selection.get("placeId"),
+        }
+    return _geocode_point(address, city, country)
+
+
+def _geocode_all(start_address, stops, city_restriction,
+                 start_selection=None, selections=None):
+    """
+    Resolve the start + every stop to coordinates (honoring city restriction and
+    manual selections). Returns (start_point, stop_objs). Raises a clean error on
+    hard failures and on strict city mismatches.
     """
     city = city_restriction["city"]
     country = city_restriction["country"]
     strict = city_restriction["strict"]
+    selections = selections or []
 
-    start = _geocode_point(start_address, city, country)
+    start = _resolve_point(start_address, start_selection, city, country)
     if city_restriction["enabled"] and strict and start["status"] == "city_mismatch":
         raise RouteError(
             f"Start city mismatch: requested {start['requestedCity']}, matched "
@@ -1324,7 +1666,8 @@ def _geocode_all(start_address, stops, city_restriction):
 
     stop_objs = []
     for index, address in enumerate(stops):
-        result = _geocode_point(address, city, country)
+        selection = selections[index] if index < len(selections) else None
+        result = _resolve_point(address, selection, city, country)
         if city_restriction["enabled"] and strict and result["status"] == "city_mismatch":
             raise RouteError(
                 f"City mismatch for stop {index + 1} ('{address}'): requested "
@@ -1332,10 +1675,11 @@ def _geocode_all(start_address, stops, city_restriction):
                 f"{result['matchedCity'] or 'unknown'}. Re-validate before optimizing.")
         stop_objs.append({
             "originalIndex": index,
-            "address": address,
+            "address": result.get("formattedAddress") or address,
             "formattedAddress": result["formattedAddress"],
             "lat": result["lat"],
             "lng": result["lng"],
+            "placeId": result.get("placeId"),
         })
     return start, stop_objs
 
@@ -1360,12 +1704,18 @@ def api_config():
 
 @app.route("/api/validate-addresses", methods=["POST"])
 def api_validate_addresses():
-    """Geocode + validate the start address and every stop (city-aware)."""
+    """Geocode + validate the start address and every stop (city-aware).
+
+    Manually selected rows are trusted (only re-checked for city) instead of
+    being re-geocoded from the original fuzzy input.
+    """
     try:
         require_api_key()
-        body, start_address, stops = _read_request()
+        body, start_address, stops, selections = _read_request()
         city_restriction = _parse_city_restriction(body)
-        return jsonify(validate_addresses(start_address, stops, city_restriction))
+        start_selection = body.get("startSelection")
+        return jsonify(validate_addresses(
+            start_address, stops, city_restriction, start_selection, selections))
     except RouteError as err:
         return jsonify({"success": False, "error": err.message}), err.status_code
     except Exception as exc:  # never leak a raw traceback
@@ -1381,17 +1731,20 @@ def api_optimize():
     """
     try:
         require_api_key()
-        body, start_address, stops = _read_request()
+        body, start_address, stops, selections = _read_request()
         return_to_start = bool(body.get("returnToStart", True))
         city_restriction = _parse_city_restriction(body)
+        start_selection = body.get("startSelection")
         clustering = body.get("clustering") or {}
         clustering_enabled = bool(clustering.get("enabled")) \
             and clustering.get("mode") in ("stops_per_route", "number_of_routes",
                                            "auto_distance", "manual")
 
-        # Geocode once (coords are reused by every route, and the city
-        # restriction is enforced as a safety net).
-        start_point, stop_objs = _geocode_all(start_address, stops, city_restriction)
+        # Resolve once (coords are reused by every route, and the city
+        # restriction is enforced as a safety net). Manual selections keep their
+        # saved place data instead of being re-geocoded.
+        start_point, stop_objs = _geocode_all(
+            start_address, stops, city_restriction, start_selection, selections)
 
         if clustering_enabled:
             result = optimize_clustered_routes(
@@ -1411,6 +1764,51 @@ def api_optimize():
 
         result["success"] = True
         return jsonify(result)
+    except RouteError as err:
+        return jsonify({"success": False, "error": err.message}), err.status_code
+    except Exception as exc:  # never leak a raw traceback
+        return jsonify({"success": False,
+                        "error": f"Unexpected server error: {exc}"}), 500
+
+
+@app.route("/api/address-candidates", methods=["POST"])
+def api_address_candidates():
+    """Return possible Google matches for one address (Places Autocomplete New).
+
+    Called on demand (when the user clicks "Choose another match"), never
+    automatically for every pasted address.
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        input_text = (body.get("input") or "").strip()
+        if not input_text:
+            raise RouteError("Address text is required.")
+        city_restriction = _parse_city_restriction(body)
+        language_code = (body.get("languageCode") or "he").strip() or "he"
+        candidates, warnings = get_address_candidates(
+            input_text, city_restriction, language_code)
+        return jsonify({"success": True, "candidates": candidates, "warnings": warnings})
+    except RouteError as err:
+        return jsonify({"success": False, "error": err.message}), err.status_code
+    except Exception as exc:  # never leak a raw traceback
+        return jsonify({"success": False,
+                        "error": f"Unexpected server error: {exc}"}), 500
+
+
+@app.route("/api/resolve-place", methods=["POST"])
+def api_resolve_place():
+    """Resolve a chosen candidate to exact place data (Places Details New)."""
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        place_id = (body.get("placeId") or "").strip()
+        if not place_id:
+            raise RouteError("placeId is required.")
+        original_input = (body.get("originalInput") or "").strip()
+        city_restriction = _parse_city_restriction(body)
+        language_code = (body.get("languageCode") or "he").strip() or "he"
+        resolved = resolve_place_details(
+            place_id, original_input, city_restriction, language_code)
+        return jsonify({"success": True, "resolved": resolved})
     except RouteError as err:
         return jsonify({"success": False, "error": err.message}), err.status_code
     except Exception as exc:  # never leak a raw traceback

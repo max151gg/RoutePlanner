@@ -40,6 +40,7 @@
       <label class="field-label" for="startAddress">Starting address</label>
       <input id="startAddress" type="text" class="text-input"
              placeholder="e.g. Herzl 1, Ramla" />
+      <div id="startMeta" class="start-meta"></div>
 
       <fieldset class="mode">
         <legend>Route mode</legend>
@@ -248,6 +249,18 @@
       </div>
     </section>
   </main>
+
+  <!-- Address Candidate Picker modal -->
+  <div id="candidateModal" class="modal-overlay hidden">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="candidateTitle">
+      <div class="modal-head">
+        <h2 id="candidateTitle">Choose address match</h2>
+        <button id="candidateClose" class="alert-close" aria-label="Close">&times;</button>
+      </div>
+      <div id="candidateContext" class="candidate-context"></div>
+      <div id="candidateBody" class="candidate-body"></div>
+    </div>
+  </div>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

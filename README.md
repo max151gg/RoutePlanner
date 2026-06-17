@@ -42,20 +42,25 @@ order, see the route on a Google Map, remove cancelled stops, and re-run.
   library.
 - **Min/max stops per route** — constrain clustering so each group has between a
   minimum and maximum number of stops (never above 25).
+- **Choose another match** — when Google matches the wrong city/street, pick the
+  correct address from a list of Google Places suggestions (on demand). The exact
+  place is saved and preserved through optimization, export/import, and autosave.
 
 Everything is held in browser memory. There is **no database** and **no login**.
 
 ## 2. Enable the Google APIs
 
 In the [Google Cloud Console](https://console.cloud.google.com/), create (or pick)
-a project and enable these three APIs:
+a project and enable these APIs:
 
 1. **Maps JavaScript API** — renders the map in the browser.
 2. **Routes API** — computes and optimizes the route (`computeRoutes`).
 3. **Geocoding API** — converts/validates addresses into coordinates.
+4. **Places API (New)** — powers the "Choose another match" address picker
+   (Autocomplete + Place Details). Only called on demand.
 
 Then create an **API key** under *APIs & Services → Credentials*. One key can be
-used for all three for local development.
+used for all of them for local development.
 
 ## 3. Create your `.env`
 
@@ -73,6 +78,9 @@ Edit `.env`:
 
 ```
 GOOGLE_MAPS_API_KEY=your_real_key_here
+# Optional: dedicated server-side key for Places API calls (never sent to the
+# browser). Falls back to GOOGLE_MAPS_API_KEY if omitted.
+GOOGLE_MAPS_SERVER_KEY=your_server_key_here
 ```
 
 ## 4. Install
@@ -320,9 +328,39 @@ results to a specific city"**, type the city and a country code (default `IL`):
   *"Requested city: Ramla. Google matched: Rosh HaAyin."*
 
 **Strict city match** (on by default) blocks optimization until every mismatch is
-fixed. Turn strict off to allow optimization with a visible warning instead.
+fixed. Turn strict off to allow optimization with a visible warning instead. When
+a mismatch happens, use **Choose another match** (next section) to pick the
+intended address.
 
-## 13. Re-validation rules
+## 13. Choosing the correct address match
+
+Google sometimes matches the wrong city or wrong street (especially when the same
+street name exists in several cities). The app already flags these as
+`city_mismatch`/`ambiguous`/`not_found`, but you can also override the match by
+hand:
+
+- Every address row (and the start address) has a **Choose another match** button.
+  It works even for a `found` result, because a found result can still be wrong.
+- Clicking it opens **"Choose address match"**, shows your original typed text and
+  the requested city, then lists possible Google matches (Places Autocomplete).
+  City-matching, address-precise results are ranked first.
+- Click **Use this address** on a candidate. The app calls Place Details, saves
+  the exact **place ID + coordinates + formatted address**, and tags the row
+  **Manually selected**. Your original input is kept too — nothing is retyped.
+- **Clear selected match** removes the pick and returns the row to normal
+  validation behavior.
+
+**On-demand only:** suggestions are fetched **when you click the button**, never
+automatically while typing or for all 50 pasted rows — this keeps Places API usage
+low. All Places calls go through the backend using `GOOGLE_MAPS_SERVER_KEY` (or
+`GOOGLE_MAPS_API_KEY` locally); the server key is **never** exposed to the browser.
+
+**Preserved everywhere:** a manual selection is used for validation, optimization
+(its saved coordinates are used — the fuzzy original is never re-geocoded),
+clustering, the visited tracker, export/import, and local autosave. Strict city
+match still applies: hand-picking a wrong-city candidate is still flagged.
+
+## 15. Re-validation rules
 
 Validation is marked **stale** (and Optimize is disabled) whenever you change the
 **start address**, any **stop**, or the **city restriction** — anything that
@@ -331,7 +369,7 @@ affects geocoding. Changing **clustering settings**, the **route mode**, or usin
 unchanged); it only marks the *optimization* as stale — just press **Optimize
 Route** again to recalculate.
 
-## 14. No database — data resets on reload
+## 16. No database — data resets on reload
 
 There is no database, no accounts, and no server-side storage. All addresses and
 results live in the browser tab. Reloading clears the in-memory working state, but
@@ -342,7 +380,7 @@ session (`routeOptimizerLite:lastSession`), named saved routes
 last session**, or import a route file. Clearing browser storage removes all of
 these.
 
-## 15. Restrict your API keys before deploying publicly
+## 17. Restrict your API keys before deploying publicly
 
 This MVP exposes the Maps JavaScript key to the browser via `/api/config`, which
 is fine for **local** use. Before any public deployment:

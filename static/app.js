@@ -13,8 +13,13 @@
 const state = {
   startAddress: "",
   startValidation: null, // validation result for the start address
-  stops: [],             // [{ id, address, status, formattedAddress, lat, lng,
-                         //    matchedCity, message }]
+  startStatus: "not_validated", // start status (validation or manual selection)
+  startSelection: null,  // manual place pick for the start (or null)
+  stops: [],             // [{ id, address, originalInput, status, formattedAddress,
+                         //    selectedFormattedAddress, placeId, manuallySelected,
+                         //    lat, lng, matchedCity, message }]
+  candidateTarget: null, // { addressType:"start"|"stop", stopIndex } while picking
+  candidates: [],        // last candidate list shown in the modal
   validated: false,      // last validation succeeded AND nothing changed since
   needsValidation: true, // list/start/city changed since last validation
   lastResult: null,      // last /api/optimize response
@@ -110,6 +115,12 @@ const el = {
   restoreLastBtn: document.getElementById("restoreLastBtn"),
   clearSessionBtn: document.getElementById("clearSessionBtn"),
   savedRoutes: document.getElementById("savedRoutes"),
+  // Address Candidate Picker
+  startMeta: document.getElementById("startMeta"),
+  candidateModal: document.getElementById("candidateModal"),
+  candidateClose: document.getElementById("candidateClose"),
+  candidateContext: document.getElementById("candidateContext"),
+  candidateBody: document.getElementById("candidateBody"),
 };
 
 // localStorage keys + schema version.
@@ -325,8 +336,12 @@ function loadStops() {
   state.stops = addresses.map((address) => ({
     id: nextId++,
     address,
+    originalInput: address,
     status: "not_validated",
     formattedAddress: null,
+    selectedFormattedAddress: null,
+    placeId: null,
+    manuallySelected: false,
     lat: null,
     lng: null,
     matchedCity: null,
@@ -386,7 +401,14 @@ function renderStops() {
     delBtn.textContent = "Delete";
     delBtn.onclick = () => deleteStop(stop.id);
 
-    top.append(num, addr, badge, editBtn, delBtn);
+    top.append(num, addr, badge);
+    if (stop.manuallySelected) {
+      const manual = document.createElement("span");
+      manual.className = "badge badge-blue";
+      manual.textContent = "Manually selected";
+      top.append(manual);
+    }
+    top.append(editBtn, delBtn);
     card.appendChild(top);
 
     // Status-specific note.
@@ -394,8 +416,9 @@ function renderStops() {
       const note = document.createElement("div");
       note.className = "stop-note error";
       note.textContent =
-        stop.message ||
-        ("City mismatch: matched " + (stop.matchedCity || "another city") + ".");
+        "Google matched another city. Click “Choose another match” to " +
+        "select the intended address" +
+        (stop.matchedCity ? " (matched " + stop.matchedCity + ")." : ".");
       card.appendChild(note);
     } else if (stop.status === "ambiguous" && stop.formattedAddress) {
       const note = document.createElement("div");
@@ -418,8 +441,85 @@ function renderStops() {
       card.appendChild(note);
     }
 
+    // Candidate-picker actions (on-demand; never auto-called).
+    const actions = document.createElement("div");
+    actions.className = "stop-actions";
+    const chooseBtn = document.createElement("button");
+    chooseBtn.className = "icon-btn";
+    chooseBtn.textContent = stop.manuallySelected
+      ? "Choose a different match" : "Choose another match";
+    chooseBtn.onclick = () => openCandidatePicker("stop", index);
+    actions.append(chooseBtn);
+    if (stop.manuallySelected) {
+      const clearBtn = document.createElement("button");
+      clearBtn.className = "icon-btn";
+      clearBtn.textContent = "Clear selected match";
+      clearBtn.onclick = () => clearSelectedMatch("stop", index);
+      actions.append(clearBtn);
+    }
+    card.appendChild(actions);
+
     el.stopsList.appendChild(card);
   });
+}
+
+/** Render the start address status badge + candidate-picker controls. */
+function renderManualSelectionBadge() {
+  renderStartMeta(); // start meta hosts the start manual badge; stops via renderStops
+}
+
+function renderStartMeta() {
+  if (!el.startMeta) return;
+  el.startMeta.innerHTML = "";
+  const status = state.startStatus || "not_validated";
+  const manual = !!(state.startSelection && state.startSelection.manuallySelected);
+
+  const row = document.createElement("div");
+  row.className = "start-meta-row";
+
+  if (status !== "not_validated") {
+    const b = BADGE[status] || BADGE.not_validated;
+    const badge = document.createElement("span");
+    badge.className = "badge " + b.cls;
+    badge.textContent = b.text;
+    row.append(badge);
+  }
+  if (manual) {
+    const mb = document.createElement("span");
+    mb.className = "badge badge-blue";
+    mb.textContent = "Manually selected";
+    row.append(mb);
+  }
+
+  const chooseBtn = document.createElement("button");
+  chooseBtn.className = "icon-btn";
+  chooseBtn.textContent = manual ? "Choose a different match" : "Choose another match";
+  chooseBtn.onclick = () => openCandidatePicker("start", null);
+  row.append(chooseBtn);
+
+  if (manual) {
+    const clearBtn = document.createElement("button");
+    clearBtn.className = "icon-btn";
+    clearBtn.textContent = "Clear selected match";
+    clearBtn.onclick = () => clearSelectedMatch("start", null);
+    row.append(clearBtn);
+  }
+  el.startMeta.append(row);
+
+  // Note line under the badges.
+  const sv = state.startValidation;
+  if (status === "city_mismatch") {
+    const note = document.createElement("div");
+    note.className = "stop-note error";
+    note.textContent =
+      "Google matched another city. Click “Choose another match” to select the intended address.";
+    el.startMeta.append(note);
+  } else if (sv && sv.formattedAddress && (status === "found" || status === "ambiguous")) {
+    const note = document.createElement("div");
+    note.className = "stop-note" + (status === "ambiguous" ? " warn" : "");
+    note.textContent = sv.formattedAddress;
+    el.startMeta.append(note);
+  }
 }
 
 /** Replace a stop's address text with an inline editable input. */
@@ -443,9 +543,13 @@ function startEdit(id) {
   const commit = () => {
     const value = input.value.trim();
     if (value) stop.address = value;
-    // Editing invalidates this stop's previous validation.
+    stop.originalInput = stop.address;
+    // Editing invalidates this stop's previous validation AND any manual pick.
     stop.status = "not_validated";
     stop.formattedAddress = null;
+    stop.selectedFormattedAddress = null;
+    stop.placeId = null;
+    stop.manuallySelected = false;
     stop.lat = stop.lng = null;
     stop.matchedCity = null;
     stop.message = null;
@@ -504,8 +608,10 @@ async function validateAddresses() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        startAddress: state.startAddress,
-        stops: state.stops.map((s) => s.address),
+        startAddress: requestStartString(),
+        stops: requestStopStrings(),
+        selections: state.stops.map(stopSelectionPayload),
+        startSelection: startSelectionPayload(),
         cityRestriction: cityRestriction,
       }),
     });
@@ -517,6 +623,7 @@ async function validateAddresses() {
     }
 
     state.startValidation = data.start;
+    state.startStatus = data.start ? data.start.status : "not_validated";
 
     // Apply per-stop results (order matches what we sent).
     data.stops.forEach((result, i) => {
@@ -528,9 +635,16 @@ async function validateAddresses() {
       stop.lng = result.lng;
       stop.matchedCity = result.matchedCity;
       stop.message = result.message;
+      // Preserve / refresh a manual selection reported by the backend.
+      if (result.manuallySelected) {
+        stop.manuallySelected = true;
+        if (result.placeId) stop.placeId = result.placeId;
+        if (result.formattedAddress) stop.selectedFormattedAddress = result.formattedAddress;
+      }
     });
 
     renderStops();
+    renderStartMeta();
     renderValidationWarnings(data);
 
     state.needsValidation = false;
@@ -582,6 +696,308 @@ function renderValidationWarnings(data) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Address Candidate Picker (manual match selection)
+ * ------------------------------------------------------------------------- */
+
+/** Build the per-stop selection payload sent to validate/optimize (or null). */
+function stopSelectionPayload(stop) {
+  if (stop && stop.manuallySelected && stop.lat != null && stop.lng != null) {
+    return {
+      manuallySelected: true,
+      placeId: stop.placeId,
+      formattedAddress: stop.selectedFormattedAddress || stop.formattedAddress,
+      lat: stop.lat,
+      lng: stop.lng,
+      matchedCity: stop.matchedCity,
+    };
+  }
+  return null;
+}
+
+function startSelectionPayload() {
+  const s = state.startSelection;
+  if (s && s.manuallySelected && s.lat != null && s.lng != null) {
+    return {
+      manuallySelected: true,
+      placeId: s.placeId,
+      formattedAddress: s.formattedAddress,
+      lat: s.lat,
+      lng: s.lng,
+      matchedCity: s.matchedCity,
+    };
+  }
+  return null;
+}
+
+/** The address string to send per row: the selected formatted address when a
+ *  manual pick exists, otherwise the typed input. */
+function requestStopStrings() {
+  return state.stops.map((s) =>
+    (s.manuallySelected && s.selectedFormattedAddress) ? s.selectedFormattedAddress : s.address);
+}
+function requestStartString() {
+  const s = state.startSelection;
+  if (s && s.manuallySelected && s.formattedAddress) return s.formattedAddress;
+  return el.start.value.trim();
+}
+
+/** Re-evaluate the optimize gate locally after a manual pick (no API call). */
+function recomputeValidationGate() {
+  const cr = getCityRestriction();
+  const blockMismatch = cr.enabled && cr.strict;
+  const statuses = [state.startStatus || "not_validated",
+                    ...state.stops.map((s) => s.status)];
+
+  if (statuses.some((s) => !s || s === "not_validated")) {
+    state.validated = false;
+    state.needsValidation = true;
+    setStatus("Needs validation", "yellow");
+    refreshOptimizeButton();
+    return;
+  }
+  const blocked = statuses.some((s) =>
+    s === "not_found" || (s === "city_mismatch" && blockMismatch));
+  state.needsValidation = false;
+  state.validated = !blocked;
+  if (!state.validated) {
+    const mismatch = statuses.includes("city_mismatch");
+    setStatus(mismatch ? "City mismatch - fix addresses" : "Fix not-found addresses",
+      mismatch ? "orange" : "red");
+  } else {
+    const warn = statuses.some((s) => s === "ambiguous" || s === "city_mismatch");
+    setStatus(warn ? "Validated (with warnings)" : "Validated", warn ? "yellow" : "green");
+  }
+  refreshOptimizeButton();
+}
+
+function candidateInputText(target) {
+  if (!target) return "";
+  if (target.addressType === "start") return el.start.value.trim();
+  const stop = state.stops[target.stopIndex];
+  return stop ? (stop.originalInput || stop.address) : "";
+}
+
+function openCandidatePicker(addressType, stopIndex) {
+  hideError();
+  state.candidateTarget = { addressType, stopIndex };
+  const inputText = candidateInputText(state.candidateTarget);
+  if (!inputText) {
+    showError("Enter an address first, then choose a match.");
+    state.candidateTarget = null;
+    return;
+  }
+  el.candidateModal.classList.remove("hidden");
+  const cr = getCityRestriction();
+  el.candidateContext.innerHTML = "";
+  const orig = document.createElement("div");
+  orig.className = "candidate-original";
+  orig.textContent = "Original: " + inputText;
+  el.candidateContext.append(orig);
+  if (cr.enabled && cr.city) {
+    const city = document.createElement("div");
+    city.className = "candidate-city";
+    city.textContent = "Requested city: " + cr.city +
+      (cr.strict ? " (strict)" : "");
+    el.candidateContext.append(city);
+  }
+  el.candidateBody.innerHTML = '<div class="candidate-loading">Loading matches…</div>';
+  loadAddressCandidates(inputText);
+}
+
+function closeCandidateModal() {
+  el.candidateModal.classList.add("hidden");
+  state.candidateTarget = null;
+  state.candidates = [];
+  el.candidateBody.innerHTML = "";
+}
+
+async function loadAddressCandidates(inputText) {
+  const cr = getCityRestriction();
+  try {
+    const resp = await fetch("/api/address-candidates", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ input: inputText, cityRestriction: cr, languageCode: "he" }),
+    });
+    const data = await resp.json();
+    if (!data.success) {
+      el.candidateBody.innerHTML =
+        '<div class="candidate-empty"></div>';
+      el.candidateBody.firstChild.textContent = data.error || "Could not load matches.";
+      return;
+    }
+    state.candidates = data.candidates || [];
+    renderCandidateModal(state.candidates, data.warnings || []);
+  } catch (err) {
+    el.candidateBody.innerHTML = '<div class="candidate-empty"></div>';
+    el.candidateBody.firstChild.textContent = "Network error: " + err.message;
+  }
+}
+
+function renderCandidateModal(candidates, warnings) {
+  el.candidateBody.innerHTML = "";
+
+  (warnings || []).forEach((w) => {
+    const warn = document.createElement("div");
+    warn.className = "candidate-warning";
+    warn.textContent = w;
+    el.candidateBody.append(warn);
+  });
+
+  if (!candidates || candidates.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "candidate-empty";
+    empty.textContent = "No matches found. Try editing the address, or turn off " +
+      "strict city match.";
+    el.candidateBody.append(empty);
+    return;
+  }
+
+  candidates.forEach((c) => {
+    const card = document.createElement("div");
+    card.className = "candidate-card";
+
+    const info = document.createElement("div");
+    info.className = "candidate-info";
+    const main = document.createElement("div");
+    main.className = "candidate-main";
+    main.textContent = c.mainText || c.displayText || "";
+    info.append(main);
+    if (c.secondaryText) {
+      const sec = document.createElement("div");
+      sec.className = "candidate-secondary";
+      sec.textContent = c.secondaryText;
+      info.append(sec);
+    }
+    const display = document.createElement("div");
+    display.className = "candidate-display";
+    display.textContent = c.displayText || "";
+    info.append(display);
+    if (Array.isArray(c.types) && c.types.length) {
+      const type = document.createElement("span");
+      type.className = "badge badge-gray candidate-type";
+      type.textContent = c.types[0];
+      info.append(type);
+    }
+    card.append(info);
+
+    const use = document.createElement("button");
+    use.className = "btn btn-primary";
+    use.textContent = "Use this address";
+    use.onclick = () => selectCandidate(c.placeId);
+    card.append(use);
+
+    el.candidateBody.append(card);
+  });
+}
+
+async function selectCandidate(placeId) {
+  const target = state.candidateTarget;
+  if (!target || !placeId) return;
+  const inputText = candidateInputText(target);
+  const cr = getCityRestriction();
+  el.candidateBody.innerHTML = '<div class="candidate-loading">Resolving…</div>';
+  try {
+    const resp = await fetch("/api/resolve-place", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ placeId, originalInput: inputText, cityRestriction: cr,
+                             languageCode: "he" }),
+    });
+    const data = await resp.json();
+    if (!data.success) {
+      el.candidateBody.innerHTML = '<div class="candidate-empty"></div>';
+      el.candidateBody.firstChild.textContent = data.error || "Could not resolve this place.";
+      return;
+    }
+    applyResolvedAddress(target.addressType, target.stopIndex, data.resolved);
+    closeCandidateModal();
+    if (data.resolved.status === "city_mismatch") {
+      showError("The selected match is in " +
+        (data.resolved.matchedCity || "another city") +
+        ". Pick a different match, or turn off strict city match.");
+    } else {
+      showInfo("Address match applied.");
+    }
+  } catch (err) {
+    el.candidateBody.innerHTML = '<div class="candidate-empty"></div>';
+    el.candidateBody.firstChild.textContent = "Network error: " + err.message;
+  }
+}
+
+function applyResolvedAddress(addressType, stopIndex, resolved) {
+  if (addressType === "start") {
+    state.startSelection = {
+      manuallySelected: true,
+      placeId: resolved.placeId,
+      formattedAddress: resolved.formattedAddress,
+      lat: resolved.lat,
+      lng: resolved.lng,
+      matchedCity: resolved.matchedCity,
+      requestedCity: resolved.requestedCity,
+      status: resolved.status,
+    };
+    state.startValidation = {
+      status: resolved.status,
+      formattedAddress: resolved.formattedAddress,
+      lat: resolved.lat,
+      lng: resolved.lng,
+      matchedCity: resolved.matchedCity,
+      message: resolved.message,
+      manuallySelected: true,
+    };
+    state.startStatus = resolved.status;
+    if (resolved.formattedAddress) {
+      state.startAddress = state.startAddress || el.start.value.trim();
+    }
+    renderStartMeta();
+  } else {
+    const stop = state.stops[stopIndex];
+    if (!stop) return;
+    stop.originalInput = stop.originalInput || stop.address;
+    stop.manuallySelected = true;
+    stop.placeId = resolved.placeId;
+    stop.selectedFormattedAddress = resolved.formattedAddress;
+    stop.formattedAddress = resolved.formattedAddress;
+    stop.lat = resolved.lat;
+    stop.lng = resolved.lng;
+    stop.matchedCity = resolved.matchedCity;
+    stop.status = resolved.status;
+    stop.message = resolved.message;
+    renderStops();
+  }
+  // A changed address invalidates any previous optimization.
+  resetGroups();
+  recomputeValidationGate();
+  scheduleSave();
+}
+
+function clearSelectedMatch(addressType, stopIndex) {
+  if (addressType === "start") {
+    state.startSelection = null;
+    state.startValidation = null;
+    state.startStatus = "not_validated";
+    renderStartMeta();
+  } else {
+    const stop = state.stops[stopIndex];
+    if (!stop) return;
+    stop.manuallySelected = false;
+    stop.placeId = null;
+    stop.selectedFormattedAddress = null;
+    stop.status = "not_validated";
+    stop.formattedAddress = null;
+    stop.lat = stop.lng = null;
+    stop.matchedCity = null;
+    stop.message = null;
+    renderStops();
+  }
+  // Back to normal validation behavior for this row.
+  resetGroups();
+  markNeedsValidation();
+  scheduleSave();
+}
+
+/* ---------------------------------------------------------------------------
  * Optimize route
  * ------------------------------------------------------------------------- */
 
@@ -626,8 +1042,10 @@ async function optimizeRoute() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        startAddress: state.startAddress,
-        stops: state.stops.map((s) => s.address),
+        startAddress: requestStartString(),
+        stops: requestStopStrings(),
+        selections: state.stops.map(stopSelectionPayload),
+        startSelection: startSelectionPayload(),
         returnToStart: returnToStart,
         endAnywhere: !returnToStart,
         clustering: clustering,
@@ -1111,8 +1529,13 @@ function clearAll() {
   state.routeSignature = null;
   state.trackingActive = false;
   state.clusterSizeSummary = null;
+  state.startStatus = "not_validated";
+  state.startSelection = null;
+  state.candidateTarget = null;
+  state.candidates = [];
 
   el.start.value = "";
+  if (el.startMeta) el.startMeta.innerHTML = "";
   el.stopsInput.value = "";
   el.stopsList.innerHTML = "";
   el.orderedList.innerHTML = "";
@@ -1754,8 +2177,12 @@ function buildSessionObject() {
   const cr = getCityRestriction();
   const stops = state.stops.map((s, i) => ({
     originalIndex: i,
-    input: s.address,
+    input: s.originalInput || s.address,
+    originalInput: s.originalInput || s.address,
     formattedAddress: s.formattedAddress,
+    selectedFormattedAddress: s.selectedFormattedAddress || null,
+    placeId: s.placeId || null,
+    manuallySelected: !!s.manuallySelected,
     lat: s.lat,
     lng: s.lng,
     validationStatus: s.status,
@@ -1787,6 +2214,9 @@ function buildSessionObject() {
       trackingActive: state.trackingActive,
       routeSignature: state.routeSignature,
       clusterSizeSummary: state.clusterSizeSummary,
+      startSelection: state.startSelection,
+      startStatus: state.startStatus,
+      startValidation: state.startValidation,
     },
   };
 }
@@ -1869,15 +2299,29 @@ function applySessionObject(obj, successMessage) {
   // Stops (rebuilt with fresh ids; rendered via textContent in renderStops).
   state.stops = (obj.stops || []).map((st) => ({
     id: nextId++,
-    address: String(st.input || ""),
+    address: String(st.originalInput || st.input || ""),
+    originalInput: String(st.originalInput || st.input || ""),
     status: typeof st.validationStatus === "string" ? st.validationStatus : "not_validated",
     formattedAddress: st.formattedAddress != null ? String(st.formattedAddress) : null,
+    selectedFormattedAddress: st.selectedFormattedAddress != null
+      ? String(st.selectedFormattedAddress) : null,
+    placeId: st.placeId != null ? String(st.placeId) : null,
+    manuallySelected: !!st.manuallySelected,
     lat: numOrNull(st.lat),
     lng: numOrNull(st.lng),
     matchedCity: st.matchedCity != null ? String(st.matchedCity) : null,
     message: null,
   }));
+
+  // Start manual selection / status.
+  const csForStart = obj.clientState || {};
+  state.startSelection = csForStart.startSelection || null;
+  state.startValidation = csForStart.startValidation || null;
+  state.startStatus = csForStart.startStatus ||
+    (state.startValidation ? state.startValidation.status : "not_validated");
+
   renderStops();
+  renderStartMeta();
   updateCounter();
 
   // UI flags + visited + result.
@@ -2209,9 +2653,26 @@ el.hideVisitedMarkers.addEventListener("change", () => {
 // Live preview of how many stops the textarea would load.
 el.stopsInput.addEventListener("input", previewCounter);
 
-// Changing the start address invalidates validation.
+// Changing the start address invalidates validation and any manual start pick.
 el.start.addEventListener("input", () => {
+  if (state.startSelection) {
+    state.startSelection = null;
+    state.startStatus = "not_validated";
+    state.startValidation = null;
+    renderStartMeta();
+  }
   if (!state.needsValidation) markNeedsValidation();
+});
+
+// Address candidate picker modal close handlers.
+el.candidateClose.addEventListener("click", closeCandidateModal);
+el.candidateModal.addEventListener("click", (e) => {
+  if (e.target === el.candidateModal) closeCandidateModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !el.candidateModal.classList.contains("hidden")) {
+    closeCandidateModal();
+  }
 });
 
 // City restriction: any change requires re-validation.
@@ -2263,6 +2724,7 @@ onClusterModeChange();
 onCityToggle();
 toggleMinMaxFields();
 updateCounter();
+renderStartMeta();
 renderSavedRoutes();
 checkSavedSessionBanner();
 

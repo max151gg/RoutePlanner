@@ -634,4 +634,92 @@ body {
 .saved-meta { font-size: 12px; color: var(--muted); }
 .saved-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
+/* --- Manual selection badge + start meta + stop actions --- */
+.badge-blue { background: #15324f; color: #7db9ff; }
+
+.start-meta { margin: 6px 0 2px; }
+.start-meta-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+
+.stop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding-left: 36px;
+}
+
+/* --- Address Candidate Picker modal --- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 11, 15, 0.72);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px;
+  z-index: 1100;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  width: 100%;
+  max-width: 560px;
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.modal-head h2 { margin: 0; font-size: 18px; }
+
+.candidate-context {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--muted);
+}
+.candidate-original { color: var(--text); font-weight: 600; word-break: break-word; }
+.candidate-city { margin-top: 2px; }
+
+.candidate-body {
+  padding: 12px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.candidate-loading, .candidate-empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
+.candidate-warning {
+  background: var(--yellow-bg);
+  border: 1px solid #5c4a14;
+  color: #f0c34a;
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.candidate-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.candidate-info { flex: 1; min-width: 0; }
+.candidate-main { font-size: 14px; font-weight: 700; word-break: break-word; }
+.candidate-secondary { font-size: 13px; color: var(--muted); word-break: break-word; }
+.candidate-display { font-size: 12px; color: var(--muted); margin-top: 2px; word-break: break-word; }
+.candidate-type { margin-top: 6px; display: inline-block; }
+.candidate-card .btn-primary { white-space: nowrap; }
+
 .hidden { display: none !important; }
